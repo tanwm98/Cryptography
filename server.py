@@ -2,242 +2,447 @@ import socket
 import threading
 import json
 import os
+import time
+from base64 import b64encode
+from argon2 import PasswordHasher
+from threading import RLock
 
+ph = PasswordHasher()
 
-# Server configuration
-HOST = "127.0.0.1"
-PORT = 65432
-USERS_FILE = "users.txt"
-FRIENDS_FILE = "friends.txt"
+# ----- Data Classes -----
 
-# Dictionary to store client connections (username: connection)
-clients = {}
+class ClientSession:
+    def __init__(self, connection, username, public_key=None):
+        self.connection = connection
+        self.username = username
+        self.public_key = public_key
+        self.session_key = os.urandom(32)
+        self.last_activity = time.time()
 
+class PendingRequest:
+    def __init__(self, from_user, to_user):
+        self.from_user = from_user
+        self.to_user = to_user
+        self.timestamp = time.time()
 
-# Load user accounts from file
-def load_users():
-    users = {}
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
-            for line in f:
-                username, password = line.strip().split(":")
+# ----- ServerState Class -----
 
-                users[username] = password
-    return users
+class ServerState:
+    def __init__(self, users_file="users.txt", friends_file="friends.txt"):
+        self.users_file = users_file
+        self.friends_file = friends_file
 
+        # Shared resources
+        self.users = {}            # username -> hashed_password
+        self.friends = {}          # username -> list of friends
+        self.clients = {}          # username -> ClientSession
+        self.pending_requests = {} # username -> list of PendingRequest
+        self.message_queues = {}   # username -> list of messages
 
-# Save user accounts to file
-def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        for username, password in users.items():
-            f.write(f"{username}:{password}\n")
+        # Use RLock to allow nested acquisitions
+        self.users_lock = RLock()
+        self.friends_lock = RLock()
+        self.clients_lock = RLock()
+        self.pending_requests_lock = RLock()
+        self.message_queues_lock = RLock()
 
+        # Documented lock order: users_lock -> friends_lock -> clients_lock -> pending_requests_lock -> message_queues_lock
+        self.lock_order = {
+            'users_lock': 1,
+            'friends_lock': 2,
+            'clients_lock': 3,
+            'pending_requests_lock': 4,
+            'message_queues_lock': 5
+        }
 
-# Load friends data from file
-def load_friends():
-    friends = {}
-    if os.path.exists(FRIENDS_FILE):
-        with open(FRIENDS_FILE, "r") as f:
-            for line in f:
+        self.load_all_data()
+
+    def load_all_data(self):
+        self.load_users()
+        self.load_friends()
+
+    def load_users(self):
+        with self.users_lock:
+            self.users = {}
+            if os.path.exists(self.users_file):
                 try:
-                    user, friend_list_str = line.strip().split(":")
-                    friend_list = friend_list_str.split(",") if friend_list_str else []
-                    friends[user] = friend_list
-                except ValueError:
-                    print(f"Invalid line in friends file: {line}")
-    return friends
+                    with open(self.users_file, "r") as f:
+                        # Expecting JSON format for atomicity
+                        self.users = json.load(f)
+                except Exception as e:
+                    print(f"Error loading users: {e}")
 
+    def load_friends(self):
+        with self.friends_lock:
+            self.friends = {}
+            if os.path.exists(self.friends_file):
+                try:
+                    with open(self.friends_file, "r") as f:
+                        self.friends = json.load(f)
+                except Exception as e:
+                    print(f"Error loading friends: {e}")
 
-# Save friends data to file
-def save_friends(friends):
-    with open(FRIENDS_FILE, "w") as f:
-        for user, friend_list in friends.items():
-            f.write(f"{user}:{','.join(friend_list)}\n")
+    def _save_data_atomic(self, filename, data):
+        temp_file = filename + ".tmp"
+        try:
+            with open(temp_file, "w") as f:
+                json.dump(data, f)
+            os.replace(temp_file, filename)
+        except Exception as e:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            print(f"Error saving {filename}: {e}")
 
+    def save_users(self):
+        with self.users_lock:
+            self._save_data_atomic(self.users_file, self.users)
 
-# Handle client communication
-def handle_client(conn, addr):
+    def save_friends(self):
+        with self.friends_lock:
+            self._save_data_atomic(self.friends_file, self.friends)
+
+    # Client session operations
+    def add_client(self, username, session):
+        with self.clients_lock:
+            self.clients[username] = session
+
+    def remove_client(self, username):
+        with self.clients_lock:
+            if username in self.clients:
+                try:
+                    self.clients[username].connection.close()
+                except Exception as e:
+                    print(f"Error closing connection for {username}: {e}")
+                del self.clients[username]
+
+    def get_client(self, username):
+        with self.clients_lock:
+            return self.clients.get(username)
+
+    def handle_connection_error(self, username):
+        with self.clients_lock:
+            if username in self.clients:
+                try:
+                    self.clients[username].connection.close()
+                except Exception:
+                    pass
+                del self.clients[username]
+                print(f"Handled connection error for {username}")
+
+    def check_connection_alive(self, username):
+        with self.clients_lock:
+            session = self.clients.get(username)
+        if session:
+            try:
+                # Send a heartbeat (empty byte string)
+                session.connection.sendall(b'')
+                return True
+            except Exception:
+                self.handle_connection_error(username)
+                return False
+        return False
+
+    # Pending requests
+    def add_pending_request(self, to_user, request):
+        with self.pending_requests_lock:
+            if to_user not in self.pending_requests:
+                self.pending_requests[to_user] = []
+            self.pending_requests[to_user].append(request)
+
+    def remove_pending_request(self, to_user, from_user):
+        with self.pending_requests_lock:
+            if to_user in self.pending_requests:
+                self.pending_requests[to_user] = [
+                    r for r in self.pending_requests[to_user] if r.from_user != from_user
+                ]
+
+    # Message queue operations
+    def add_message(self, username, message):
+        with self.message_queues_lock:
+            if username not in self.message_queues:
+                self.message_queues[username] = []
+            self.message_queues[username].append(message)
+
+    def get_messages(self, username):
+        with self.message_queues_lock:
+            messages = self.message_queues.get(username, [])
+            self.message_queues[username] = []
+            return messages
+
+# ----- Client Handler -----
+
+def handle_client(conn, addr, server_state: ServerState):
     print(f"Connected by {addr}")
-    users = load_users()  # Load users at the start of each connection
-    friends = load_friends()
-
+    username = None
     try:
         while True:
             data = conn.recv(1024).decode("utf-8")
             if not data:
-                break
+                break  # Connection closed by client
 
             try:
                 message = json.loads(data)
                 print(f"Received: {message}")
+                message_type = message.get("type")
 
-                if message["type"] == "register":
+                if message_type == "register":
                     username = message["username"]
                     password = message["password"]
+                    with server_state.users_lock:
+                        if username in server_state.users:
+                            response = {"type": "registration_failed", "message": "Username already exists."}
+                        else:
+                            try:
+                                hashed_password = ph.hash(password)
+                            except Exception:
+                                response = {"type": "registration_failed", "message": "Error hashing password."}
+                            else:
+                                server_state.users[username] = hashed_password
+                                server_state.save_users()
+                                with server_state.friends_lock:
+                                    server_state.friends[username] = []
+                                    server_state.save_friends()
+                                response = {"type": "registration_success", "message": "Registration successful."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
 
-                    if username in users:
-                        response_message = json.dumps(
-                            {
-                                "type": "registration_failed",
-                                "message": "Username already exists.",
-                            }
-                        )
-                        conn.sendall(response_message.encode("utf-8"))
-                    else:
-                        users[username] = password
-                        save_users(users)
-                        friends[username] = []  # Initialize friend list for new user
-                        save_friends(friends)
-                        response_message = json.dumps(
-                            {
-                                "type": "registration_success",
-                                "message": "Registration successful.",
-                            }
-                        )
-                        conn.sendall(response_message.encode("utf-8"))
-                        print(f"User {username} registered.")
-
-                elif message["type"] == "login":
+                elif message_type == "login":
                     username = message["username"]
                     password = message["password"]
+                    public_key = message.get("public_key")
+                    with server_state.users_lock:
+                        if username in server_state.users:
+                            try:
+                                ph.verify(server_state.users[username], password)
+                            except Exception:
+                                response = {"type": "login_failed", "message": "Invalid username or password."}
+                            else:
+                                session = ClientSession(conn, username, public_key)
+                                server_state.add_client(username, session)
+                                with server_state.friends_lock:
+                                    friend_list = server_state.friends.get(username, [])
+                                response = {
+                                    "type": "login_success",
+                                    "message": "Login successful.",
+                                    "username": username,
+                                    "friends": friend_list,
+                                    "session_key": b64encode(session.session_key).decode("utf-8")
+                                }
+                        else:
+                            response = {"type": "login_failed", "message": "Invalid username or password."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
 
-                    if username in users and users[username] == password:
-                        clients[username] = conn  # Store the connection
-                        response_message = json.dumps(
-                            {
-                                "type": "login_success",
-                                "message": "Login successful.",
-                                "username": username,
-                                "friends": friends.get(
-                                    username, []
-                                ),  # Send friend list to client
-                            }
-                        )
-                        conn.sendall(response_message.encode("utf-8"))
-                        print(f"User {username} logged in.")
-                    else:
-                        response_message = json.dumps(
-                            {
-                                "type": "login_failed",
-                                "message": "Invalid username or password.",
-                            }
-                        )
-                        conn.sendall(response_message.encode("utf-8"))
-
-                elif message["type"] == "request_location":
+                elif message_type == "request_location":
                     target_client_id = message["target_client_id"]
                     requesting_client_id = message["client_id"]
 
-                    if target_client_id in clients:
-                        # Forward the location request to the target client
-                        target_conn = clients[target_client_id]
-                        request_message = json.dumps(
-                            {
-                                "type": "location_request",
-                                "from_client_id": requesting_client_id,
-                            }
-                        )
-                        target_conn.sendall(request_message.encode("utf-8"))
-                        print(f"Sent location request to client {target_client_id}")
+                    # Add friendship check
+                    with server_state.friends_lock:
+                        if (requesting_client_id not in server_state.friends.get(target_client_id, []) or
+                                target_client_id not in server_state.friends.get(requesting_client_id, [])):
+                            response = {"type": "error", "message": "You must be friends to request location"}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            return
 
-                    else:
-                        # Client not found
-                        response_message = json.dumps(
-                            {
-                                "type": "error",
-                                "message": f"Client {target_client_id} not found.",
-                            }
-                        )
-                        conn.sendall(response_message.encode("utf-8"))
+                    # Update grid size to 100x100
+                    target_session = server_state.get_client(target_client_id)
+                    if target_session:
+                        request_message = {"type": "location_request", "from_client_id": requesting_client_id}
+                        try:
+                            target_session.connection.sendall(json.dumps(request_message).encode("utf-8"))
+                            print(f"Sent location request to client {target_client_id}")
+                        except Exception as e:
+                            print(f"Error notifying location request: {e}")
+                            server_state.handle_connection_error(target_client_id)
 
-                elif message["type"] == "location_response":
-                    # Forward the location data to the requesting client
+                elif message_type == "location_response":
                     requesting_client_id = message["to_client_id"]
                     location_data = message["location"]
-
-                    if requesting_client_id in clients:
-                        requesting_conn = clients[requesting_client_id]
-                        response_message = json.dumps(
-                            {"type": "location_data", "location": location_data}
-                        )
-                        requesting_conn.sendall(response_message.encode("utf-8"))
-                        print(f"Sent location data to client {requesting_client_id}")
+                    target_session = server_state.get_client(requesting_client_id)
+                    if target_session:
+                        response_message = {
+                            "type": "location_data",
+                            "location": location_data,
+                            "timestamp": time.time()
+                        }
+                        try:
+                            target_session.connection.sendall(json.dumps(response_message).encode("utf-8"))
+                            print(f"Sent location data to client {requesting_client_id}")
+                        except Exception as e:
+                            print(f"Error sending location data: {e}")
+                            server_state.handle_connection_error(requesting_client_id)
                     else:
                         print(f"Requesting client {requesting_client_id} not found.")
 
-                elif message["type"] == "add_friend":
+                elif message_type == "add_friend":
                     user = message["username"]
                     friend_to_add = message["friend_username"]
-
-                    if friend_to_add in users:
-                        if user not in friends:
-                            friends[user] = []
-                        if friend_to_add not in friends[user]:
-                            friends[user].append(friend_to_add)
-                            save_friends(friends)
-                            response_message = json.dumps(
-                                {
-                                    "type": "friend_added",
-                                    "message": f"{friend_to_add} added to {user}'s friend list.",
-                                }
-                            )
-                            conn.sendall(response_message.encode("utf-8"))
-                            print(f"{friend_to_add} added to {user}'s friend list.")
+                    with server_state.users_lock:
+                        if friend_to_add not in server_state.users:
+                            response = {"type": "error", "message": f"User {friend_to_add} not found."}
                         else:
-                            response_message = json.dumps(
-                                {
-                                    "type": "error",
-                                    "message": f"{friend_to_add} is already in {user}'s friend list.",
-                                }
-                            )
-                            conn.sendall(response_message.encode("utf-8"))
-                    else:
-                        response_message = json.dumps(
-                            {
-                                "type": "error",
-                                "message": f"User {friend_to_add} not found.",
-                            }
-                        )
-                        conn.sendall(response_message.encode("utf-8"))
+                            with server_state.friends_lock:
+                                if user not in server_state.friends:
+                                    server_state.friends[user] = []
+                                if friend_to_add in server_state.friends[user]:
+                                    response = {"type": "error", "message": f"{friend_to_add} is already in {user}'s friend list."}
+                                else:
+                                    server_state.friends[user].append(friend_to_add)
+                                    server_state.save_friends()
+                                    response = {"type": "friend_added", "friend_username": friend_to_add, "message": f"{friend_to_add} added to {user}'s friend list."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
 
-                elif message["type"] == "view_friend":
-                    response_message = json.dumps(
-                        {
-                            "type": "view_friends",
-                            "friends": friends.get(
-                                username, []
-                            ),  # Send friend list to client
-                        }
-                    )
-                    conn.sendall(response_message.encode("utf-8"))
+                elif message_type == "friend_request":
+                    from_user = message["from"]
+                    to_user = message["to"]
+                    if from_user == to_user:
+                        response = {"type": "error", "message": "Cannot add yourself."}
+                        conn.sendall(json.dumps(response).encode("utf-8"))
+                        continue
+                    with server_state.users_lock:
+                        if to_user not in server_state.users or from_user not in server_state.users:
+                            response = {"type": "error", "message": "Invalid user specified."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                    with server_state.friends_lock:
+                        if to_user in server_state.friends and from_user in server_state.friends[to_user]:
+                            response = {"type": "error", "message": "Already friends."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                    with server_state.pending_requests_lock:
+                        pending = server_state.pending_requests.get(to_user, [])
+                        if any(r.from_user == from_user for r in pending):
+                            response = {"type": "error", "message": "Request already pending."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                        new_request = PendingRequest(from_user, to_user)
+                        server_state.add_pending_request(to_user, new_request)
+                    target_session = server_state.get_client(to_user)
+                    if target_session:
+                        try:
+                            notify = {"type": "friend_request_received", "from": from_user}
+                            target_session.connection.sendall(json.dumps(notify).encode("utf-8"))
+                        except Exception as e:
+                            print(f"Error notifying friend request: {e}")
+                            server_state.handle_connection_error(to_user)
+                    response = {"type": "success", "message": "Friend request sent."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
 
-                elif message["type"] == "message_user":
+                elif message_type == "accept_friend_request":
+                    from_user = message["from"]
+                    to_user = message["to"]
+                    with server_state.pending_requests_lock:
+                        pending = server_state.pending_requests.get(to_user, [])
+                        if not any(r.from_user == from_user for r in pending):
+                            response = {"type": "error", "message": "No pending request found."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                        server_state.remove_pending_request(to_user, from_user)
+                    with server_state.friends_lock:
+                        if to_user not in server_state.friends:
+                            server_state.friends[to_user] = []
+                        if from_user not in server_state.friends:
+                            server_state.friends[from_user] = []
+                        if from_user not in server_state.friends[to_user]:
+                            server_state.friends[to_user].append(from_user)
+                        if to_user not in server_state.friends[from_user]:
+                            server_state.friends[from_user].append(to_user)
+                        server_state.save_friends()
+                    session_from = server_state.get_client(from_user)
+                    if session_from:
+                        try:
+                            notify = {"type": "friend_request_accepted", "by": to_user, "friends": server_state.friends.get(from_user, [])}
+                            session_from.connection.sendall(json.dumps(notify).encode("utf-8"))
+                        except Exception as e:
+                            print(f"Error notifying friend acceptance: {e}")
+                            server_state.handle_connection_error(from_user)
+                    session_to = server_state.get_client(to_user)
+                    if session_to:
+                        try:
+                            update = {"type": "view_friends", "friends": server_state.friends.get(to_user, [])}
+                            session_to.connection.sendall(json.dumps(update).encode("utf-8"))
+                        except Exception as e:
+                            print(f"Error updating friend list: {e}")
+                            server_state.handle_connection_error(to_user)
+
+                elif message_type == "message_user":
                     from_client_id = message["from_client_id"]
                     to_client_id = message["to_client_id"]
                     message_data = message["content"]
-
-                    if to_client_id in clients:
-                        # Forward the location request to the target client
-                        target_conn = clients[to_client_id]
-                        request_message = json.dumps(
-                            {
-                                "type": "message_user",
-                                "from_client_id": from_client_id,
-                                "content": message_data,
-                            }
-                        )
-                        target_conn.sendall(request_message.encode("utf-8"))
-                        print(f"Sent location request to client {to_client_id}")
-
+                    target_session = server_state.get_client(to_client_id)
+                    if target_session:
+                        try:
+                            forward = {"type": "received_message", "from_client_id": from_client_id, "content": message_data}
+                            target_session.connection.sendall(json.dumps(forward).encode("utf-8"))
+                            print(f"Sent message to client {to_client_id}")
+                        except Exception as e:
+                            print(f"Error forwarding message: {e}")
+                            server_state.handle_connection_error(to_client_id)
                     else:
-                        # Client not found
-                        response_message = json.dumps(
-                            {
-                                "type": "error",
-                                "message": f"Client {to_client_id} not found.",
-                            }
-                        )
-                        conn.sendall(response_message.encode("utf-8"))
+                        server_state.add_message(to_client_id, {"from": from_client_id, "content": message_data, "timestamp": time.time()})
+                        response = {"type": "message_stored", "message": "Message stored for offline delivery."}
+                        conn.sendall(json.dumps(response).encode("utf-8"))
+
+                elif message_type == "get_messages":
+                    username = message["username"]
+                    messages = server_state.get_messages(username)
+                    response = {"type": "queued_messages", "messages": messages}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                elif message_type == "update_location":
+                    username = message["username"]
+                    x = message["x"]
+                    y = message["y"]
+                    with server_state.users_lock:
+                        if username not in server_state.users:
+                            response = {"type": "error", "message": "User not found"}
+                        else:
+                            if 0 <= x <= 99999 and 0 <= y <= 99999:
+                                with server_state.clients_lock:
+                                    session = server_state.clients.get(username)
+                                    if session:
+                                        session.x = x
+                                        session.y = y
+                                        response = {
+                                            "type": "location_update_success",
+                                            "message": "Location updated successfully"
+                                        }
+                                    else:
+                                        response = {"type": "error", "message": "User session not found"}
+                            else:
+                                response = {"type": "error", "message": "Coordinates out of bounds"}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                elif message_type == "get_public_key":
+                    target_username = message["target"]
+                    with server_state.clients_lock:
+                        target_session = server_state.clients.get(target_username)
+                        if target_session and target_session.public_key:
+                            # Ensure the public key is sent as a string
+                            if isinstance(target_session.public_key, bytes):
+                                pubkey_str = target_session.public_key.decode("utf-8")
+                            else:
+                                pubkey_str = target_session.public_key
+                            response = {"type": "public_key_response", "target": target_username,
+                                        "public_key": pubkey_str}
+                        else:
+                            response = {"type": "error", "message": "Public key not found."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                elif message_type == "get_friend_requests":
+                    username = message["username"]
+                    with server_state.pending_requests_lock:
+                        pending = server_state.pending_requests.get(username, [])
+                        # Create a list of requestor usernames
+                        request_list = [r.from_user for r in pending]
+                    response = {"type": "friend_requests", "requests": request_list}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                else:
+                    response = {"type": "error", "message": "Invalid message type."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+
+                # Update session last activity if username is provided in the message
+                if "username" in message:
+                    with server_state.clients_lock:
+                        session = server_state.clients.get(message["username"])
+                        if session:
+                            session.last_activity = time.time()
 
             except json.JSONDecodeError:
                 print(f"Received invalid JSON data: {data}")
@@ -246,27 +451,58 @@ def handle_client(conn, addr):
 
     except Exception as e:
         print(f"Error communicating with client: {e}")
+
     finally:
-        # Clean up when the client disconnects
-        for username, connection in list(clients.items()):
-            if connection == conn:
-                del clients[username]
-                print(f"Client {username} disconnected.")
-                break
-        conn.close()
+        # Comprehensive cleanup for client session and associated resources
+        with server_state.clients_lock:
+            to_remove = None
+            for uname, session in list(server_state.clients.items()):
+                if session.connection == conn:
+                    to_remove = uname
+                    break
+            if to_remove:
+                server_state.remove_client(to_remove)
+                print(f"Cleaned up resources for {to_remove}")
+        try:
+            conn.close()
+        except Exception as e:
+            print(f"Error closing connection: {e}")
 
 
-def start_server():
+# ----- Session Cleanup Task -----
+def session_cleanup_task(server_state, timeout=3600, interval=60):
+    while True:
+        time.sleep(interval)
+        current_time = time.time()
+        with server_state.clients_lock:
+            for username, session in list(server_state.clients.items()):
+                if current_time - session.last_activity > timeout:
+                    try:
+                        session.connection.close()
+                    except Exception as e:
+                        print(f"Error closing session for {username}: {e}")
+                    del server_state.clients[username]
+                    print(f"Session timeout for {username}")
+
+
+# ----- Server Startup -----
+def start_server(server_state, host="127.0.0.1", port=65432):
+    cleanup_thread = threading.Thread(target=session_cleanup_task, args=(server_state,), daemon=True)
+    cleanup_thread.start()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, PORT))
+        s.bind((host, port))
         s.listen()
-        print(f"Server listening on {HOST}:{PORT}")
-
+        print(f"Server listening on {host}:{port}")
         while True:
-            conn, addr = s.accept()
-            thread = threading.Thread(target=handle_client, args=(conn, addr))
-            thread.start()
+            try:
+                conn, addr = s.accept()
+                client_thread = threading.Thread(target=handle_client, args=(conn, addr, server_state), daemon=True)
+                client_thread.start()
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
 
+# ----- Main Execution -----
 
 if __name__ == "__main__":
-    start_server()
+    server_state = ServerState()
+    start_server(server_state)
