@@ -7,7 +7,8 @@ import os
 from cryptography.exceptions import InvalidKey
 from cryptography.hazmat.primitives import serialization, hashes, hmac
 from cryptography.hazmat.primitives import padding as symmetric_padding
-from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding, ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64encode, b64decode
 from argon2 import PasswordHasher
@@ -82,33 +83,24 @@ class Config:
 class SecureGridLocation:
     def __init__(self, resolution=1000):
         self.resolution = resolution
-        self.key = None  # Will be set from session key
-
-    def set_key(self, key):
-        self.key = key
-
-    def generate_cell_proof(self, x, y, timestamp):
-        if not self.key:
-            raise ValueError("No key set for SecureGridLocation")
-        cell = self.coordinates_to_cell(x, y)
-        h = hmac.HMAC(self.key, hashes.SHA256())
-        h.update(f"{cell[0]},{cell[1]},{timestamp}".encode())
-        return b64encode(h.finalize()).decode('utf-8')  # Convert bytes to base64 string
 
     def coordinates_to_cell(self, x, y):
         return (x // self.resolution, y // self.resolution)
 
-    def verify_proof(self, x, y, proof, timestamp):
-        if not self.key:
-            raise ValueError("No key set")
+    def generate_cell_proof(self, x, y, timestamp, key):
         cell = self.coordinates_to_cell(x, y)
-        return self.verify_cell_proof(cell, proof, timestamp)
+        h = hmac.HMAC(key, hashes.SHA256())
+        msg = f"{cell[0]},{cell[1]},{timestamp}".encode()
+        h.update(msg)
+        return b64encode(h.finalize()).decode('utf-8')
 
-    def verify_cell_proof(self, cell, proof, timestamp):
-        h = hmac.HMAC(self.key, hashes.SHA256())
-        h.update(f"{cell[0]},{cell[1]},{timestamp}".encode())
+    def verify_cell_proof(self, x, y, proof, timestamp, key):
+        cell = self.coordinates_to_cell(x, y)
+        h = hmac.HMAC(key, hashes.SHA256())
+        msg = f"{cell[0]},{cell[1]},{timestamp}".encode()
+        h.update(msg)
         try:
-            h.verify(b64decode(proof))  # Decode base64 string back to bytes
+            h.verify(b64decode(proof))
             return True
         except InvalidKey:
             return False
@@ -127,8 +119,6 @@ class Client:
         self.private_key = None
         self.session_key = None
         self.grid_location = None
-        self.public_key_cache = {}  # username -> (public_key, timestamp)
-        self.cache_timeout = 300  # 5 minutes
         # Thread safety locks
         self.friends_lock = threading.RLock()
         self.message_queue_lock = threading.RLock()
@@ -190,12 +180,13 @@ class Client:
             if 0 <= x <= 99999 and 0 <= y <= 99999:
                 self.x = x
                 self.y = y
+                cell = self.grid_location.coordinates_to_cell(x, y)
                 # Send update to server
                 update_message = json.dumps({
                     "type": "update_location",
                     "username": self.username,
-                    "x": x,
-                    "y": y
+                    "cell_x": cell[0],
+                    "cell_y": cell[1]
                 })
                 self.socket.sendall(update_message.encode("utf-8"))
             else:
@@ -259,9 +250,12 @@ class Client:
 
         try:
             # Generate keypair for this session
-            self.private_key = rsa.generate_private_key(
-                public_exponent=65537,
-                key_size=2048
+            self.private_key = ec.generate_private_key(ec.SECP256K1())
+            public_key = self.private_key.public_key()
+
+            public_pem = public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
             )
             public_key = self.private_key.public_key()
 
@@ -446,47 +440,123 @@ class Client:
         if not self.grid_location:
             print("Error: Grid location system not initialized")
             return
-        timestamp = int(time.time())
-        cell = self.grid_location.coordinates_to_cell(self.x, self.y)
-        location_data = {
-            "cell_x": cell[0],
-            "cell_y": cell[1],
-            "timestamp": timestamp,
-            "proof": self.grid_location.generate_cell_proof(self.x, self.y, timestamp)
-        }
-        encrypted_location = self.encrypt_for_recipient(to_client_id, location_data)
-        response_message = json.dumps({
-            "type": "location_response",
-            "to_client_id": to_client_id,
-            "location": encrypted_location,
-        })
-        self.send_message(response_message)
+        try:
+            timestamp = int(time.time())
+            cell = self.grid_location.coordinates_to_cell(self.x, self.y)
+
+            # Get recipient's public key first
+            request = json.dumps({
+                "type": "get_public_key",
+                "target": to_client_id
+            })
+            self.send_message(request)
+            response = json.loads(self.socket.recv(1024).decode("utf-8"))
+            if response["type"] != "public_key_response":
+                raise Exception("Failed to get recipient's public key")
+
+            recipient_public_key = serialization.load_pem_public_key(
+                b64decode(response["public_key"])
+            )
+
+            # Generate ephemeral key and derive shared key
+            ephemeral_private = ec.generate_private_key(ec.SECP256K1())
+            shared_key = ephemeral_private.exchange(
+                ec.ECDH(),
+                recipient_public_key
+            )
+
+            # Derive key for both encryption and proof
+            derived_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b'location-sharing',
+            ).derive(shared_key)
+
+            # Generate location data with proof using derived key
+            location_data = {
+                "cell_x": cell[0],
+                "cell_y": cell[1],
+                "timestamp": timestamp,
+                "proof": self.grid_location.generate_cell_proof(self.x, self.y, timestamp, derived_key)
+            }
+
+            # Encrypt location data
+            encrypted_location = self.encrypt_for_recipient(to_client_id, location_data, ephemeral_private,
+                                                            recipient_public_key)
+
+            response_message = json.dumps({
+                "type": "location_response",
+                "to_client_id": to_client_id,
+                "location": encrypted_location,
+            })
+            self.send_message(response_message)
+
+        except Exception as e:
+            print(f"DEBUG - Error in send_location: {e}")
 
     def proximity_check_cell(self, encrypted_location):
         if not self.grid_location:
             print("Error: Grid location system not initialized")
             return False
         try:
+            print("DEBUG - Starting proximity check")
+            print("DEBUG - Received encrypted location:", encrypted_location)
+
+            ephemeral_public_key_pem = b64decode(encrypted_location["ephemeral_public_key"])
+            ephemeral_public_key = serialization.load_pem_public_key(ephemeral_public_key_pem)
+            print("DEBUG - Loaded ephemeral public key")
+
+            shared_key = self.private_key.exchange(
+                ec.ECDH(),
+                ephemeral_public_key
+            )
+            print("DEBUG - Generated shared key")
+
+            derived_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b'location-sharing',
+            ).derive(shared_key)
+            print("DEBUG - Derived key")
+
+            # Verify MAC first
+            print("DEBUG - About to verify MAC")
+            mac = b64decode(encrypted_location["mac"])
+            h = hmac.HMAC(derived_key, hashes.SHA256())
+            h.update(b64decode(encrypted_location["encrypted"]))
+            try:
+                h.verify(mac)
+                print("DEBUG - MAC verification successful")
+            except InvalidKey:
+                print("DEBUG - MAC verification failed - keys don't match")
+                return False
+
             location = self.decrypt_location(encrypted_location)
+            print("DEBUG - Decrypted location:", location)
+
+            # Now verify the proof using the same derived key
             if not self.grid_location.verify_cell_proof(
-                (location["cell_x"], location["cell_y"]),
-                location["proof"],
-                location["timestamp"]
+                    self.x,
+                    self.y,
+                    location["proof"],
+                    location["timestamp"],
+                    derived_key
             ):
-                print("Location verification failed!")
+                print("DEBUG - Location proof verification failed")
                 return False
-            if time.time() - location["timestamp"] > 300:
-                print("Location data expired!")
-                return False
+
+            # Check if in same or adjacent cell
             my_cell = self.grid_location.coordinates_to_cell(self.x, self.y)
             their_cell = (location["cell_x"], location["cell_y"])
             dx = abs(my_cell[0] - their_cell[0])
             dy = abs(my_cell[1] - their_cell[1])
             return dx <= 1 and dy <= 1
-        except Exception as e:
-            print(f"Error checking proximity: {e}")
-            return False
 
+        except Exception as e:
+            print(f"DEBUG - Error in proximity_check_cell: {e}")
+            return False
     def add_friend(self, friend_username):
         if not self.is_logged_in:
             print("You must log in before adding a friend.")
@@ -522,60 +592,72 @@ class Client:
         })
         self.send_message(message)
 
-    def encrypt_for_recipient(self, to_client_id, data):
-        request = json.dumps({
-            "type": "get_public_key",
-            "target": to_client_id
-        })
-        self.send_message(request)
-        response = json.loads(self.socket.recv(1024).decode("utf-8"))
-        if response["type"] != "public_key_response":
-            raise Exception("Failed to get recipient's public key")
-        recipient_public_key_pem = b64decode(response["public_key"])
-        recipient_public_key = serialization.load_pem_public_key(recipient_public_key_pem)
-        sym_key = os.urandom(32)
-        iv = os.urandom(16)  # Changed to 16 bytes for CBC mode
-        padder = symmetric_padding.PKCS7(128).padder()
-        data_bytes = json.dumps(data).encode()
-        padded_data = padder.update(data_bytes) + padder.finalize()
-        cipher = Cipher(algorithms.AES(sym_key), modes.CBC(iv))
-        encryptor = cipher.encryptor()
-        encrypted = encryptor.update(padded_data) + encryptor.finalize()
-        h = hmac.HMAC(sym_key, hashes.SHA256())
-        h.update(encrypted)
-        mac = h.finalize()
-        encrypted_key = recipient_public_key.encrypt(
-            sym_key,
-            asymmetric_padding.OAEP(
-                mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
+    def encrypt_for_recipient(self, to_client_id, data, ephemeral_private, recipient_public_key):
+        try:
+            shared_key = ephemeral_private.exchange(
+                ec.ECDH(),
+                recipient_public_key
             )
-        )
-        return {
-            "encrypted": b64encode(encrypted).decode('utf-8'),
-            "iv": b64encode(iv).decode('utf-8'),
-            "encrypted_key": b64encode(encrypted_key).decode('utf-8'),
-            "mac": b64encode(mac).decode()
-        }
+
+            derived_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b'location-sharing',
+            ).derive(shared_key)
+
+            iv = os.urandom(16)
+            padder = symmetric_padding.PKCS7(128).padder()
+            data_bytes = json.dumps(data).encode()
+            padded_data = padder.update(data_bytes) + padder.finalize()
+            cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
+            encryptor = cipher.encryptor()
+            encrypted = encryptor.update(padded_data) + encryptor.finalize()
+
+            h = hmac.HMAC(derived_key, hashes.SHA256())
+            h.update(encrypted)
+            mac = h.finalize()
+
+            ephemeral_public_pem = ephemeral_private.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+
+            return {
+                "encrypted": b64encode(encrypted).decode('utf-8'),
+                "iv": b64encode(iv).decode('utf-8'),
+                "ephemeral_public_key": b64encode(ephemeral_public_pem).decode('utf-8'),
+                "mac": b64encode(mac).decode('utf-8')
+            }
+        except Exception as e:
+            print(f"DEBUG - Error in encrypt_for_recipient: {e}")
+            raise
 
     def decrypt_location(self, encrypted_data):
         try:
-            encrypted_key = b64decode(encrypted_data["encrypted_key"])
-            sym_key = self.private_key.decrypt(
-                encrypted_key,
-                asymmetric_padding.OAEP(
-                    mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
-                )
+            ephemeral_public_key_pem = b64decode(encrypted_data["ephemeral_public_key"])
+            ephemeral_public_key = serialization.load_pem_public_key(ephemeral_public_key_pem)
+
+            shared_key = self.private_key.exchange(
+                ec.ECDH(),
+                ephemeral_public_key
             )
+
+            derived_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b'location-sharing',
+            ).derive(shared_key)
+
             iv = b64decode(encrypted_data["iv"])
-            cipher = Cipher(algorithms.AES(sym_key), modes.CBC(iv))
+            cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
             decryptor = cipher.decryptor()
             decrypted = decryptor.update(b64decode(encrypted_data["encrypted"]))
             decrypted += decryptor.finalize()
-            return json.loads(decrypted.rstrip().decode())
+            unpadder = symmetric_padding.PKCS7(128).unpadder()
+            unpadded = unpadder.update(decrypted) + unpadder.finalize()
+            return json.loads(unpadded.decode())
         except Exception as e:
             print(f"Error decrypting location data: {e}")
             raise
@@ -609,10 +691,6 @@ class Client:
             return False
 
     def get_public_key(self, username):
-        if username in self.public_key_cache:
-            key, timestamp = self.public_key_cache[username]
-            if time.time() - timestamp < self.cache_timeout:
-                return key
         request = json.dumps({
             "type": "get_public_key",
             "target": username
@@ -624,8 +702,6 @@ class Client:
         public_key = serialization.load_pem_public_key(
             b64decode(response["public_key"])
         )
-        self.public_key_cache[username] = (public_key, time.time())
-        return public_key
 
     def send_friend_request(self, friend_username):
         message = json.dumps({

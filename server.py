@@ -389,18 +389,18 @@ def handle_client(conn, addr, server_state: ServerState):
                     conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "update_location":
                     username = message["username"]
-                    x = message["x"]
-                    y = message["y"]
+                    cell_x = message["cell_x"]
+                    cell_y = message["cell_y"]
                     with server_state.users_lock:
                         if username not in server_state.users:
                             response = {"type": "error", "message": "User not found"}
                         else:
-                            if 0 <= x <= 99999 and 0 <= y <= 99999:
+                            if 0 <= cell_x <= 99999 and 0 <= cell_y <= 99999:
                                 with server_state.clients_lock:
                                     session = server_state.clients.get(username)
                                     if session:
-                                        session.x = x
-                                        session.y = y
+                                        session.cell_x = cell_x
+                                        session.y = cell_y
                                         response = {
                                             "type": "location_update_success",
                                             "message": "Location updated successfully"
