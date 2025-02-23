@@ -94,15 +94,30 @@ class SecureGridLocation:
         h.update(msg)
         return b64encode(h.finalize()).decode('utf-8')
 
-    def verify_cell_proof(self, x, y, proof, timestamp, key):
-        cell = self.coordinates_to_cell(x, y)
-        h = hmac.HMAC(key, hashes.SHA256())
-        msg = f"{cell[0]},{cell[1]},{timestamp}".encode()
-        h.update(msg)
+    def verify_cell_proof(self, cell_x, cell_y, proof, timestamp, key):
         try:
-            h.verify(b64decode(proof))
-            return True
-        except InvalidKey:
+            print("\nDEBUG - Starting cell proof verification")
+            print(f"DEBUG - Checking cell ({cell_x}, {cell_y})")
+            print(f"DEBUG - Timestamp: {timestamp}")
+
+            h = hmac.HMAC(key, hashes.SHA256())
+            msg = f"{cell_x},{cell_y},{timestamp}".encode()
+            print(f"DEBUG - Verification message: {msg}")
+
+            h.update(msg)
+            try:
+                h.verify(b64decode(proof))
+                print("DEBUG - ✓ Cell proof verification successful")
+                return True
+            except InvalidKey:
+                print("DEBUG - ✗ Cell proof verification failed - Invalid key")
+                return False
+            except Exception as e:
+                print(f"DEBUG - ✗ Cell proof verification failed: {e}")
+                return False
+
+        except Exception as e:
+            print(f"DEBUG - ✗ Error in verify_cell_proof: {e}")
             return False
 
 
@@ -496,66 +511,97 @@ class Client:
             print(f"DEBUG - Error in send_location: {e}")
 
     def proximity_check_cell(self, encrypted_location):
-        if not self.grid_location:
-            print("Error: Grid location system not initialized")
-            return False
         try:
-            print("DEBUG - Starting proximity check")
-            print("DEBUG - Received encrypted location:", encrypted_location)
+            print("\nDEBUG - Starting proximity check with detailed logging")
+            print(f"DEBUG - My current location: cell ({self.x // 1000}, {self.y // 1000})")
+            print("DEBUG - Steps:")
 
+            # Step 1: Load ephemeral key
+            print("DEBUG - 1. Loading ephemeral public key...")
             ephemeral_public_key_pem = b64decode(encrypted_location["ephemeral_public_key"])
             ephemeral_public_key = serialization.load_pem_public_key(ephemeral_public_key_pem)
-            print("DEBUG - Loaded ephemeral public key")
+            print("DEBUG - ✓ Ephemeral key loaded successfully")
 
+            # Step 2: Generate shared key
+            print("DEBUG - 2. Generating shared key...")
             shared_key = self.private_key.exchange(
                 ec.ECDH(),
                 ephemeral_public_key
             )
-            print("DEBUG - Generated shared key")
+            print("DEBUG - ✓ Shared key generated")
 
+            # Step 3: Derive key
+            print("DEBUG - 3. Deriving key using HKDF...")
             derived_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
                 info=b'location-sharing',
             ).derive(shared_key)
-            print("DEBUG - Derived key")
+            print("DEBUG - ✓ Key derived successfully")
 
-            # Verify MAC first
-            print("DEBUG - About to verify MAC")
+            # Step 4: MAC verification
+            print("DEBUG - 4. Starting MAC verification...")
             mac = b64decode(encrypted_location["mac"])
             h = hmac.HMAC(derived_key, hashes.SHA256())
             h.update(b64decode(encrypted_location["encrypted"]))
             try:
                 h.verify(mac)
-                print("DEBUG - MAC verification successful")
+                print("DEBUG - ✓ MAC verification successful")
             except InvalidKey:
-                print("DEBUG - MAC verification failed - keys don't match")
+                print("DEBUG - ✗ MAC verification failed - Invalid key")
+                return False
+            except Exception as e:
+                print(f"DEBUG - ✗ MAC verification failed with error: {e}")
                 return False
 
-            location = self.decrypt_location(encrypted_location)
-            print("DEBUG - Decrypted location:", location)
-
-            # Now verify the proof using the same derived key
-            if not self.grid_location.verify_cell_proof(
-                    self.x,
-                    self.y,
-                    location["proof"],
-                    location["timestamp"],
-                    derived_key
-            ):
-                print("DEBUG - Location proof verification failed")
+            # Step 5: Decrypt location
+            print("DEBUG - 5. Decrypting location data...")
+            try:
+                location = self.decrypt_location(encrypted_location)
+                print(f"DEBUG - ✓ Successfully decrypted location: {location}")
+            except Exception as e:
+                print(f"DEBUG - ✗ Failed to decrypt location: {e}")
                 return False
 
-            # Check if in same or adjacent cell
+            # Step 6: Verify proof
+            print("DEBUG - 6. Verifying location proof...")
+            try:
+                if not self.grid_location.verify_cell_proof(
+                        location["cell_x"],  # Use their cell coordinates
+                        location["cell_y"],
+                        location["proof"],
+                        location["timestamp"],
+                        derived_key
+                ):
+                    print("DEBUG - ✗ Location proof verification failed")
+                    return False
+                print("DEBUG - ✓ Location proof verified")
+            except Exception as e:
+                print(f"DEBUG - ✗ Error during proof verification: {e}")
+                return False
+
+            # Step 7: Check proximity
+            print("DEBUG - 7. Checking cell proximity...")
             my_cell = self.grid_location.coordinates_to_cell(self.x, self.y)
             their_cell = (location["cell_x"], location["cell_y"])
             dx = abs(my_cell[0] - their_cell[0])
             dy = abs(my_cell[1] - their_cell[1])
-            return dx <= 1 and dy <= 1
+
+            print(f"DEBUG - My cell: {my_cell}")
+            print(f"DEBUG - Their cell: {their_cell}")
+            print(f"DEBUG - Cell distance: dx={dx}, dy={dy}")
+
+            is_nearby = dx <= 1 and dy <= 1
+            print(f"DEBUG - Proximity result: {'Nearby' if is_nearby else 'Not nearby'}")
+
+            return is_nearby
 
         except Exception as e:
-            print(f"DEBUG - Error in proximity_check_cell: {e}")
+            print("\nDEBUG - Unexpected error in proximity_check_cell:")
+            print(f"DEBUG - Error type: {type(e).__name__}")
+            print(f"DEBUG - Error message: {str(e)}")
+            print(f"DEBUG - Error location: {e.__traceback__.tb_frame.f_code.co_name}")
             return False
     def add_friend(self, friend_username):
         if not self.is_logged_in:
