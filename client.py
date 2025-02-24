@@ -336,8 +336,11 @@ class Client:
                     self.send_location(from_client_id)
                 elif message_type == "location_data":
                     location = message["location"]
-                    if self.proximity_check_cell(location):
+                    is_nearby, is_same_cell = self.proximity_check_cell(location)
+                    if is_same_cell:
                         print("Friend is nearby! (Same Cell)")
+                    elif is_nearby:
+                        print("Friend is nearby! (Adjacent Cell)")
                     else:
                         print("Friend is not nearby!")
                 elif message_type == "error":
@@ -581,10 +584,9 @@ class Client:
             print(f"DEBUG - Their cell: {their_cell}")
             print(f"DEBUG - Cell distance: dx={dx}, dy={dy}")
 
+            is_same_cell = dx == 0 and dy == 0
             is_nearby = dx <= 1 and dy <= 1
-            print(f"DEBUG - Proximity result: {'Nearby' if is_nearby else 'Not nearby'}")
-
-            return is_nearby
+            return is_nearby, is_same_cell
 
         except Exception as e:
             print("\nDEBUG - Unexpected error in proximity_check_cell:")
