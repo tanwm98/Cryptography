@@ -1,170 +1,514 @@
 import socket
-import json
 import threading
+import json
+import os
 import time
-from cryptography.fernet import Fernet
-import hashlib
+from base64 import b64encode
+from argon2 import PasswordHasher
+from threading import RLock
 
-class Server:
-    def __init__(self, host='localhost', port=5000):
-        self.users = {}  # Now includes location data
-        self.friends = {}  # {username: [friend1, friend2, ...]}
-        self.friend_requests = {}  # {username: [pending_requests]}
-        self.locations = {}  # {username: (x, y)}
-        self.messages = {}  # {username: [messages]}
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind((host, port))
+ph = PasswordHasher()
 
-    def start(self):
-        self.sock.listen()
-        print("Server started on localhost:5000")
-        while True:
-            conn, addr = self.sock.accept()
-            print(f"New connection from {addr}")
-            thread = threading.Thread(target=self.handle_client, args=(conn,))
-            thread.start()
+# ----- Data Classes -----
 
-    def handle_client(self, conn):
-        try:
-            while True:
-                data = conn.recv(1024).decode()
-                if not data:
-                    break
-                print(f"Received: {data}")
-                msg = json.loads(data)
-                response = self.process_message(msg)
-                print(f"Sending: {response}")
-                conn.send(json.dumps(response).encode())
-        except Exception as e:
-            print(f"Error: {e}")
-        finally:
-            conn.close()
+class ClientSession:
+    def __init__(self, connection, username, public_key=None):
+        self.connection = connection
+        self.username = username
+        self.public_key = public_key
+        self.session_key = os.urandom(32)
+        self.last_activity = time.time()
 
-    def process_message(self, msg):
-        try:
-            action = msg.get('action')
-            if action == 'register':
-                return self.register_user(msg['username'], msg['password'])
-            elif action == 'login':
-                return self.login_user(msg['username'], msg['password'])
-            elif action == 'update_location':
-                return self.update_location(msg['username'], msg['x'], msg['y'])
-            elif action == 'get_cell':
-                return self.get_cell(msg['username'])
-            elif action == 'send_friend_request':
-                return self.send_friend_request(msg['from_user'], msg['to_user'])
-            elif action == 'accept_friend_request':
-                return self.accept_friend_request(msg['from_user'], msg['to_user'])
-            elif action == 'get_friend_requests':
-                return self.get_friend_requests(msg['username'])
-            elif action == 'get_friends':
-                return self.get_friends(msg['username'])
-            elif action == 'send_message':
-                return self.send_message(msg['from_user'], msg['to_user'], msg['content'])
-            elif action == 'get_messages':
-                return self.get_messages(msg['username'])
-            return {'status': 'error', 'message': 'Invalid action'}
-        except Exception as e:
-            return {'status': 'error', 'message': str(e)}
+class PendingRequest:
+    def __init__(self, from_user, to_user):
+        self.from_user = from_user
+        self.to_user = to_user
+        self.timestamp = time.time()
 
-    def register_user(self, username, password):
-        if username in self.users:
-            return {'status': 'error', 'message': 'Username already exists'}
-        
-        self.users[username] = {
-            'password': hashlib.sha256(password.encode()).hexdigest(),
-            'key': Fernet.generate_key()
+# ----- ServerState Class -----
+
+class ServerState:
+    def __init__(self, users_file="users.txt", friends_file="friends.txt"):
+        self.users_file = users_file
+        self.friends_file = friends_file
+
+        # Shared resources
+        self.users = {}            # username -> hashed_password
+        self.friends = {}          # username -> list of friends
+        self.clients = {}          # username -> ClientSession
+        self.pending_requests = {} # username -> list of PendingRequest
+        self.message_queues = {}   # username -> list of messages
+
+        # Use RLock to allow nested acquisitions
+        self.users_lock = RLock()
+        self.friends_lock = RLock()
+        self.clients_lock = RLock()
+        self.pending_requests_lock = RLock()
+        self.message_queues_lock = RLock()
+
+        # Documented lock order: users_lock -> friends_lock -> clients_lock -> pending_requests_lock -> message_queues_lock
+        self.lock_order = {
+            'users_lock': 1,
+            'friends_lock': 2,
+            'clients_lock': 3,
+            'pending_requests_lock': 4,
+            'message_queues_lock': 5
         }
-        self.friends[username] = []
-        self.friend_requests[username] = []
-        self.messages[username] = []
-        self.locations[username] = (0, 0)  # Default location
-        return {'status': 'success', 'message': 'Registration successful'}
 
-    def login_user(self, username, password):
-        if username not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-        
-        if self.users[username]['password'] != hashlib.sha256(password.encode()).hexdigest():
-            return {'status': 'error', 'message': 'Invalid password'}
-        
-        return {'status': 'success', 'message': 'Login successful'}
+        self.load_all_data()
 
-    def update_location(self, username, x, y):
-        if username not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-        
-        if not (0 <= x <= 99999 and 0 <= y <= 99999):
-            return {'status': 'error', 'message': 'Coordinates out of bounds'}
-            
-        self.locations[username] = (x, y)
-        return {'status': 'success', 'message': 'Location updated'}
+    def load_all_data(self):
+        self.load_users()
+        self.load_friends()
 
-    def get_cell(self, username):
-        if username not in self.locations:
-            return {'status': 'error', 'message': 'User location not found'}
-        
-        x, y = self.locations[username]
-        cell_x = x // 1000
-        cell_y = y // 1000
-        return {'status': 'success', 'cell': (cell_x, cell_y)}
+    def load_users(self):
+        with self.users_lock:
+            self.users = {}
+            if os.path.exists(self.users_file):
+                try:
+                    with open(self.users_file, "r") as f:
+                        # Expecting JSON format for atomicity
+                        self.users = json.load(f)
+                except Exception as e:
+                    print(f"Error loading users: {e}")
 
-    def send_friend_request(self, from_user, to_user):
-        if from_user not in self.users or to_user not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-            
-        if to_user in self.friends[from_user]:
-            return {'status': 'error', 'message': 'Already friends'}
-            
-        if from_user in self.friend_requests[to_user]:
-            return {'status': 'error', 'message': 'Friend request already sent'}
-            
-        self.friend_requests[to_user].append(from_user)
-        return {'status': 'success', 'message': 'Friend request sent'}
+    def load_friends(self):
+        with self.friends_lock:
+            self.friends = {}
+            if os.path.exists(self.friends_file):
+                try:
+                    with open(self.friends_file, "r") as f:
+                        self.friends = json.load(f)
+                except Exception as e:
+                    print(f"Error loading friends: {e}")
 
-    def accept_friend_request(self, from_user, to_user):
-        if from_user not in self.users or to_user not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-            
-        if from_user not in self.friend_requests[to_user]:
-            return {'status': 'error', 'message': 'No friend request found'}
-            
-        self.friend_requests[to_user].remove(from_user)
-        self.friends[to_user].append(from_user)
-        self.friends[from_user].append(to_user)
-        return {'status': 'success', 'message': 'Friend request accepted'}
+    def _save_data_atomic(self, filename, data):
+        temp_file = filename + ".tmp"
+        try:
+            with open(temp_file, "w") as f:
+                json.dump(data, f)
+            os.replace(temp_file, filename)
+        except Exception as e:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            print(f"Error saving {filename}: {e}")
 
-    def get_friend_requests(self, username):
-        if username not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-        return {'status': 'success', 'requests': self.friend_requests[username]}
+    def save_users(self):
+        with self.users_lock:
+            self._save_data_atomic(self.users_file, self.users)
 
-    def get_friends(self, username):
-        if username not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-        return {'status': 'success', 'friends': self.friends[username]}
+    def save_friends(self):
+        with self.friends_lock:
+            self._save_data_atomic(self.friends_file, self.friends)
 
-    def send_message(self, from_user, to_user, content):
-        if from_user not in self.users or to_user not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-        if to_user not in self.friends[from_user]:
-            return {'status': 'error', 'message': 'Not friends with user'}
-        
-        message = {
-            'from': from_user,
-            'content': content,
-            'timestamp': time.time()
-        }
-        self.messages[to_user].append(message)
-        return {'status': 'success', 'message': 'Message sent'}
+    # Client session operations
+    def add_client(self, username, session):
+        with self.clients_lock:
+            self.clients[username] = session
+
+    def remove_client(self, username):
+        with self.clients_lock:
+            if username in self.clients:
+                try:
+                    self.clients[username].connection.close()
+                except Exception as e:
+                    print(f"Error closing connection for {username}: {e}")
+                del self.clients[username]
+
+    def get_client(self, username):
+        with self.clients_lock:
+            return self.clients.get(username)
+
+    def handle_connection_error(self, username):
+        with self.clients_lock:
+            if username in self.clients:
+                try:
+                    self.clients[username].connection.close()
+                except Exception:
+                    pass
+                del self.clients[username]
+                print(f"Handled connection error for {username}")
+
+    def check_connection_alive(self, username):
+        with self.clients_lock:
+            session = self.clients.get(username)
+        if session:
+            try:
+                # Send a heartbeat (empty byte string)
+                session.connection.sendall(b'')
+                return True
+            except Exception:
+                self.handle_connection_error(username)
+                return False
+        return False
+
+    # Pending requests
+    def add_pending_request(self, to_user, request):
+        with self.pending_requests_lock:
+            if to_user not in self.pending_requests:
+                self.pending_requests[to_user] = []
+            self.pending_requests[to_user].append(request)
+
+    def remove_pending_request(self, to_user, from_user):
+        with self.pending_requests_lock:
+            if to_user in self.pending_requests:
+                self.pending_requests[to_user] = [
+                    r for r in self.pending_requests[to_user] if r.from_user != from_user
+                ]
+
+    # Message queue operations
+    def add_message(self, username, message):
+        with self.message_queues_lock:
+            if username not in self.message_queues:
+                self.message_queues[username] = []
+            self.message_queues[username].append(message)
 
     def get_messages(self, username):
-        if username not in self.users:
-            return {'status': 'error', 'message': 'User not found'}
-        messages = self.messages[username]
-        self.messages[username] = []
-        return {'status': 'success', 'messages': messages}
+        with self.message_queues_lock:
+            messages = self.message_queues.get(username, [])
+            self.message_queues[username] = []
+            return messages
 
-if __name__ == '__main__':
-    server = Server()
-    server.start()
+# ----- Client Handler -----
+
+def handle_client(conn, addr, server_state: ServerState):
+    print(f"Connected by {addr}")
+    username = None
+    try:
+        while True:
+            data = conn.recv(1024).decode("utf-8")
+            if not data:
+                break  # Connection closed by client
+
+            try:
+                message = json.loads(data)
+                print(f"Received: {message}")
+                message_type = message.get("type")
+
+                if message_type == "register":
+                    username = message["username"]
+                    password = message["password"]
+                    with server_state.users_lock:
+                        if username in server_state.users:
+                            response = {"type": "registration_failed", "message": "Username already exists."}
+                        else:
+                            try:
+                                hashed_password = ph.hash(password)
+                            except Exception:
+                                response = {"type": "registration_failed", "message": "Error hashing password."}
+                            else:
+                                server_state.users[username] = hashed_password
+                                server_state.save_users()
+                                with server_state.friends_lock:
+                                    server_state.friends[username] = []
+                                    server_state.save_friends()
+                                response = {"type": "registration_success", "message": "Registration successful."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+
+                elif message_type == "login":
+                    username = message["username"]
+                    password = message["password"]
+                    public_key = message.get("public_key")
+                    with server_state.users_lock:
+                        if username in server_state.users:
+                            try:
+                                ph.verify(server_state.users[username], password)
+                            except Exception:
+                                response = {"type": "login_failed", "message": "Invalid username or password."}
+                            else:
+                                session = ClientSession(conn, username, public_key)
+                                server_state.add_client(username, session)
+                                with server_state.friends_lock:
+                                    friend_list = server_state.friends.get(username, [])
+                                response = {
+                                    "type": "login_success",
+                                    "message": "Login successful.",
+                                    "username": username,
+                                    "friends": friend_list,
+                                    "session_key": b64encode(session.session_key).decode("utf-8")
+                                }
+                        else:
+                            response = {"type": "login_failed", "message": "Invalid username or password."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+
+                elif message_type == "request_location":
+                    target_client_id = message["target_client_id"]
+                    requesting_client_id = message["client_id"]
+
+                    # Add friendship check
+                    with server_state.friends_lock:
+                        if (requesting_client_id not in server_state.friends.get(target_client_id, []) or
+                                target_client_id not in server_state.friends.get(requesting_client_id, [])):
+                            response = {"type": "error", "message": "You must be friends to request location"}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            return
+
+                    # Update grid size to 100x100
+                    target_session = server_state.get_client(target_client_id)
+                    if target_session:
+                        request_message = {"type": "location_request", "from_client_id": requesting_client_id}
+                        try:
+                            target_session.connection.sendall(json.dumps(request_message).encode("utf-8"))
+                            print(f"Sent location request to client {target_client_id}")
+                        except Exception as e:
+                            print(f"Error notifying location request: {e}")
+                            server_state.handle_connection_error(target_client_id)
+
+                elif message_type == "location_response":
+                    requesting_client_id = message["to_client_id"]
+                    location_data = message["location"]
+                    target_session = server_state.get_client(requesting_client_id)
+                    if target_session:
+                        response_message = {
+                            "type": "location_data",
+                            "location": location_data,
+                            "timestamp": time.time()
+                        }
+                        try:
+                            target_session.connection.sendall(json.dumps(response_message).encode("utf-8"))
+                            print(f"Sent location data to client {requesting_client_id}")
+                        except Exception as e:
+                            print(f"Error sending location data: {e}")
+                            server_state.handle_connection_error(requesting_client_id)
+                    else:
+                        print(f"Requesting client {requesting_client_id} not found.")
+
+                elif message_type == "add_friend":
+                    user = message["username"]
+                    friend_to_add = message["friend_username"]
+                    with server_state.users_lock:
+                        if friend_to_add not in server_state.users:
+                            response = {"type": "error", "message": f"User {friend_to_add} not found."}
+                        else:
+                            with server_state.friends_lock:
+                                if user not in server_state.friends:
+                                    server_state.friends[user] = []
+                                if friend_to_add in server_state.friends[user]:
+                                    response = {"type": "error", "message": f"{friend_to_add} is already in {user}'s friend list."}
+                                else:
+                                    server_state.friends[user].append(friend_to_add)
+                                    server_state.save_friends()
+                                    response = {"type": "friend_added", "friend_username": friend_to_add, "message": f"{friend_to_add} added to {user}'s friend list."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                elif message_type == "view_friends":
+                    response_message = {"type": "view_friends", "friends": server_state.friends.get(message["username"], [])}
+                    conn.sendall(json.dumps(response_message).encode("utf-8"))
+                elif message_type == "friend_request":
+                    from_user = message["from"]
+                    to_user = message["to"]
+                    if from_user == to_user:
+                        response = {"type": "error", "message": "Cannot add yourself."}
+                        conn.sendall(json.dumps(response).encode("utf-8"))
+                        continue
+                    with server_state.users_lock:
+                        if to_user not in server_state.users or from_user not in server_state.users:
+                            response = {"type": "error", "message": "Invalid user specified."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                    with server_state.friends_lock:
+                        if to_user in server_state.friends and from_user in server_state.friends[to_user]:
+                            response = {"type": "error", "message": "Already friends."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                    with server_state.pending_requests_lock:
+                        pending = server_state.pending_requests.get(to_user, [])
+                        if any(r.from_user == from_user for r in pending):
+                            response = {"type": "error", "message": "Request already pending."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                        new_request = PendingRequest(from_user, to_user)
+                        server_state.add_pending_request(to_user, new_request)
+                    target_session = server_state.get_client(to_user)
+                    if target_session:
+                        try:
+                            notify = {"type": "friend_request_received", "from": from_user}
+                            target_session.connection.sendall(json.dumps(notify).encode("utf-8"))
+                        except Exception as e:
+                            print(f"Error notifying friend request: {e}")
+                            server_state.handle_connection_error(to_user)
+                    response = {"type": "success", "message": "Friend request sent."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+
+                elif message_type == "accept_friend_request":
+                    from_user = message["from"]
+                    to_user = message["to"]
+                    with server_state.pending_requests_lock:
+                        pending = server_state.pending_requests.get(to_user, [])
+                        if not any(r.from_user == from_user for r in pending):
+                            response = {"type": "error", "message": "No pending request found."}
+                            conn.sendall(json.dumps(response).encode("utf-8"))
+                            continue
+                        server_state.remove_pending_request(to_user, from_user)
+                    with server_state.friends_lock:
+                        if to_user not in server_state.friends:
+                            server_state.friends[to_user] = []
+                        if from_user not in server_state.friends:
+                            server_state.friends[from_user] = []
+                        if from_user not in server_state.friends[to_user]:
+                            server_state.friends[to_user].append(from_user)
+                        if to_user not in server_state.friends[from_user]:
+                            server_state.friends[from_user].append(to_user)
+                        server_state.save_friends()
+                    session_from = server_state.get_client(from_user)
+                    if session_from:
+                        try:
+                            notify = {"type": "friend_request_accepted", "by": to_user, "friends": server_state.friends.get(from_user, [])}
+                            session_from.connection.sendall(json.dumps(notify).encode("utf-8"))
+                        except Exception as e:
+                            print(f"Error notifying friend acceptance: {e}")
+                            server_state.handle_connection_error(from_user)
+                    session_to = server_state.get_client(to_user)
+                    if session_to:
+                        try:
+                            update = {
+                                "type": "view_friends",
+                                "friends": server_state.friends.get(to_user, []),
+                                "message": "Friend list updated after accepting request"
+                            }
+                            session_to.connection.sendall(json.dumps(update).encode("utf-8"))
+                        except Exception as e:
+                            print(f"Error updating friend list: {e}")
+                            server_state.handle_connection_error(to_user)
+
+                elif message_type == "message_user":
+                    from_client_id = message["from_client_id"]
+                    to_client_id = message["to_client_id"]
+                    message_data = message["content"]
+                    target_session = server_state.get_client(to_client_id)
+                    if target_session:
+                        try:
+                            forward = {"type": "received_message", "from_client_id": from_client_id, "content": message_data}
+                            target_session.connection.sendall(json.dumps(forward).encode("utf-8"))
+                            print(f"Sent message to client {to_client_id}")
+                        except Exception as e:
+                            print(f"Error forwarding message: {e}")
+                            server_state.handle_connection_error(to_client_id)
+                    else:
+                        server_state.add_message(to_client_id, {"from": from_client_id, "content": message_data, "timestamp": time.time()})
+                        response = {"type": "message_stored", "message": "Message stored for offline delivery."}
+                        conn.sendall(json.dumps(response).encode("utf-8"))
+
+                elif message_type == "get_messages":
+                    username = message["username"]
+                    messages = server_state.get_messages(username)
+                    response = {"type": "queued_messages", "messages": messages}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                # elif message_type == "update_location":
+                #     username = message["username"]
+                #     cell_x = message["cell_x"]
+                #     cell_y = message["cell_y"]
+                #     with server_state.users_lock:
+                #         if username not in server_state.users:
+                #             response = {"type": "error", "message": "User not found"}
+                #         else:
+                #             if 0 <= cell_x <= 99999 and 0 <= cell_y <= 99999:
+                #                 with server_state.clients_lock:
+                #                     session = server_state.clients.get(username)
+                #                     if session:
+                #                         session.cell_x = cell_x
+                #                         session.y = cell_y
+                #                         response = {
+                #                             "type": "location_update_success",
+                #                             "message": "Location updated successfully"
+                #                         }
+                #                     else:
+                #                         response = {"type": "error", "message": "User session not found"}
+                #             else:
+                #                 response = {"type": "error", "message": "Coordinates out of bounds"}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                elif message_type == "get_public_key":
+                    target_username = message["target"]
+                    with server_state.clients_lock:
+                        target_session = server_state.clients.get(target_username)
+                        if target_session and target_session.public_key:
+                            # Ensure the public key is sent as a string
+                            if isinstance(target_session.public_key, bytes):
+                                pubkey_str = target_session.public_key.decode("utf-8")
+                            else:
+                                pubkey_str = target_session.public_key
+                            response = {"type": "public_key_response", "target": target_username,
+                                        "public_key": pubkey_str}
+                        else:
+                            response = {"type": "error", "message": "Public key not found."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                elif message_type == "get_friend_requests":
+                    username = message["username"]
+                    with server_state.pending_requests_lock:
+                        pending = server_state.pending_requests.get(username, [])
+                        # Create a list of requestor usernames
+                        request_list = [r.from_user for r in pending]
+                    response = {"type": "friend_requests", "requests": request_list}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+                else:
+                    response = {"type": "error", "message": "Invalid message type."}
+                    conn.sendall(json.dumps(response).encode("utf-8"))
+
+                # Update session last activity if username is provided in the message
+                if "username" in message:
+                    with server_state.clients_lock:
+                        session = server_state.clients.get(message["username"])
+                        if session:
+                            session.last_activity = time.time()
+
+            except json.JSONDecodeError:
+                print(f"Received invalid JSON data: {data}")
+            except Exception as e:
+                print(f"Error processing message: {e}")
+
+    except Exception as e:
+        print(f"Error communicating with client: {e}")
+
+    finally:
+        # Comprehensive cleanup for client session and associated resources
+        with server_state.clients_lock:
+            to_remove = None
+            for uname, session in list(server_state.clients.items()):
+                if session.connection == conn:
+                    to_remove = uname
+                    break
+            if to_remove:
+                server_state.remove_client(to_remove)
+                print(f"Cleaned up resources for {to_remove}")
+        try:
+            conn.close()
+        except Exception as e:
+            print(f"Error closing connection: {e}")
+
+
+# ----- Session Cleanup Task -----
+def session_cleanup_task(server_state, timeout=3600, interval=60):
+    while True:
+        time.sleep(interval)
+        current_time = time.time()
+        with server_state.clients_lock:
+            for username, session in list(server_state.clients.items()):
+                if current_time - session.last_activity > timeout:
+                    try:
+                        session.connection.close()
+                    except Exception as e:
+                        print(f"Error closing session for {username}: {e}")
+                    del server_state.clients[username]
+                    print(f"Session timeout for {username}")
+
+
+# ----- Server Startup -----
+def start_server(server_state, host="127.0.0.1", port=65432):
+    cleanup_thread = threading.Thread(target=session_cleanup_task, args=(server_state,), daemon=True)
+    cleanup_thread.start()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, port))
+        s.listen()
+        print(f"Server listening on {host}:{port}")
+        while True:
+            try:
+                conn, addr = s.accept()
+                client_thread = threading.Thread(target=handle_client, args=(conn, addr, server_state), daemon=True)
+                client_thread.start()
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
+
+# ----- Main Execution -----
+
+if __name__ == "__main__":
+    server_state = ServerState()
+    start_server(server_state)
