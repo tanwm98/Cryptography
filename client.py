@@ -100,6 +100,13 @@ class SecureGridLocation:
             print(f"DEBUG - Checking cell ({cell_x}, {cell_y})")
             print(f"DEBUG - Timestamp: {timestamp}")
 
+            # Add timestamp freshness check
+            current_time = int(time.time())
+            max_age = 30  # 30 seconds
+            if abs(current_time - timestamp) > max_age:
+                print(f"DEBUG - ✗ Timestamp too old: {current_time - timestamp} seconds")
+                return False
+
             h = hmac.HMAC(key, hashes.SHA256())
             msg = f"{cell_x},{cell_y},{timestamp}".encode()
             print(f"DEBUG - Verification message: {msg}")
@@ -229,13 +236,27 @@ class Client:
             return False
 
         try:
+            # Generate long-term identity keypair
+            identity_private_key = ec.generate_private_key(ec.SECP256K1())
+            identity_public_key = identity_private_key.public_key()
+
+            # Store private key locally
+            self.identity_private_key = identity_private_key
+
+            # Serialize public key for transmission
+            public_pem = identity_public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+
             message = json.dumps({
                 "type": "register",
                 "username": username,
-                "password": password
+                "password": password,
+                "identity_public_key": b64encode(public_pem).decode('utf-8'),
+                "key_created": int(time.time())
             })
             self.socket.sendall(message.encode("utf-8"))
-            # Response will be handled by receive_messages thread
             return True
         except Exception as e:
             print(f"Registration error: {e}")
@@ -452,18 +473,11 @@ class Client:
             cell = self.grid_location.coordinates_to_cell(self.x, self.y)
 
             # Get recipient's public key first
-            request = json.dumps({
-                "type": "get_public_key",
-                "target": to_client_id
-            })
-            self.send_message(request)
-            response = json.loads(self.socket.recv(1024).decode("utf-8"))
-            if response["type"] != "public_key_response":
-                raise Exception("Failed to get recipient's public key")
-
-            recipient_public_key = serialization.load_pem_public_key(
-                b64decode(response["public_key"])
-            )
+            try:
+                recipient_public_key = self.get_public_key(to_client_id)
+            except Exception as e:
+                print(f"Failed to get verified public key: {e}")
+                return
 
             # Generate ephemeral key and derive shared key
             ephemeral_private = ec.generate_private_key(ec.SECP256K1())
@@ -522,59 +536,61 @@ class Client:
             )
             print("DEBUG - ✓ Shared key generated")
 
-            # Step 3: Derive key
-            print("DEBUG - 3. Deriving key using HKDF...")
-            derived_key = HKDF(
+            # Step 3: Derive separate keys
+            print("DEBUG - 3. Deriving separate keys using HKDF...")
+            encryption_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing',
+                info=b'location-sharing-encryption',
             ).derive(shared_key)
-            print("DEBUG - ✓ Key derived successfully")
 
-            # Step 4: MAC verification
-            print("DEBUG - 4. Starting MAC verification...")
-            mac = b64decode(encrypted_location["mac"])
-            h = hmac.HMAC(derived_key, hashes.SHA256())
-            h.update(b64decode(encrypted_location["encrypted"]))
+            proof_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b'location-sharing-proof',
+            ).derive(shared_key)
+            print("DEBUG - ✓ Keys derived successfully")
+
+            # Step 4: Decrypt with GCM
+            print("DEBUG - 4. Starting GCM decryption and authentication...")
             try:
-                h.verify(mac)
-                print("DEBUG - ✓ MAC verification successful")
-            except InvalidKey:
-                print("DEBUG - ✗ MAC verification failed - Invalid key")
-                return False
-            except Exception as e:
-                print(f"DEBUG - ✗ MAC verification failed with error: {e}")
-                return False
+                nonce = b64decode(encrypted_location["nonce"])
+                ciphertext = b64decode(encrypted_location["encrypted"])
+                tag = b64decode(encrypted_location["tag"])
 
-            # Step 5: Decrypt location
-            print("DEBUG - 5. Decrypting location data...")
-            try:
-                location = self.decrypt_location(encrypted_location)
-                print(f"DEBUG - ✓ Successfully decrypted location: {location}")
+                cipher = Cipher(
+                    algorithms.AES(encryption_key),
+                    modes.GCM(nonce, tag)
+                )
+                decryptor = cipher.decryptor()
+                decrypted = decryptor.update(ciphertext) + decryptor.finalize()
+                location = json.loads(decrypted.decode())
+                print("DEBUG - ✓ GCM authentication and decryption successful")
             except Exception as e:
-                print(f"DEBUG - ✗ Failed to decrypt location: {e}")
-                return False
+                print(f"DEBUG - ✗ GCM authentication or decryption failed: {e}")
+                return False, False
 
-            # Step 6: Verify proof
-            print("DEBUG - 6. Verifying location proof...")
+            # Step 5: Verify proof using proof_key
+            print("DEBUG - 5. Verifying location proof...")
             try:
                 if not self.grid_location.verify_cell_proof(
-                        location["cell_x"],  # Use their cell coordinates
+                        location["cell_x"],
                         location["cell_y"],
                         location["proof"],
                         location["timestamp"],
-                        derived_key
+                        proof_key  # Use proof_key here
                 ):
                     print("DEBUG - ✗ Location proof verification failed")
-                    return False
+                    return False, False
                 print("DEBUG - ✓ Location proof verified")
             except Exception as e:
                 print(f"DEBUG - ✗ Error during proof verification: {e}")
-                return False
+                return False, False
 
-            # Step 7: Check proximity
-            print("DEBUG - 7. Checking cell proximity...")
+            # Step 6: Check proximity
+            print("DEBUG - 6. Checking cell proximity...")
             my_cell = self.grid_location.coordinates_to_cell(self.x, self.y)
             their_cell = (location["cell_x"], location["cell_y"])
             dx = abs(my_cell[0] - their_cell[0])
@@ -593,7 +609,7 @@ class Client:
             print(f"DEBUG - Error type: {type(e).__name__}")
             print(f"DEBUG - Error message: {str(e)}")
             print(f"DEBUG - Error location: {e.__traceback__.tb_frame.f_code.co_name}")
-            return False
+            return False, False
 
     def add_friend(self, friend_username):
         if not self.is_logged_in:
@@ -632,40 +648,56 @@ class Client:
 
     def encrypt_for_recipient(self, to_client_id, data, ephemeral_private, recipient_public_key):
         try:
+            # Generate shared secret using ECDH
             shared_key = ephemeral_private.exchange(
                 ec.ECDH(),
                 recipient_public_key
             )
 
-            derived_key = HKDF(
+            # Derive separate keys for encryption and proof
+            encryption_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing',
+                info=b'location-sharing-encryption',
             ).derive(shared_key)
 
-            iv = os.urandom(16)
-            padder = symmetric_padding.PKCS7(128).padder()
-            data_bytes = json.dumps(data).encode()
-            padded_data = padder.update(data_bytes) + padder.finalize()
-            cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
+            proof_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b'location-sharing-proof',
+            ).derive(shared_key)
+
+            # Generate random nonce for GCM
+            nonce = os.urandom(12)
+
+            # Create GCM cipher
+            cipher = Cipher(
+                algorithms.AES(encryption_key),
+                modes.GCM(nonce)
+            )
             encryptor = cipher.encryptor()
-            encrypted = encryptor.update(padded_data) + encryptor.finalize()
 
-            h = hmac.HMAC(derived_key, hashes.SHA256())
-            h.update(encrypted)
-            mac = h.finalize()
-
-            ephemeral_public_pem = ephemeral_private.public_key().public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            # Generate location proof using proof_key
+            data['proof'] = self.grid_location.generate_cell_proof(
+                self.x, self.y,
+                data['timestamp'],
+                proof_key  # Use proof_key here
             )
 
+            # Convert data to bytes and encrypt
+            data_bytes = json.dumps(data).encode()
+            ciphertext = encryptor.update(data_bytes) + encryptor.finalize()
+
             return {
-                "encrypted": b64encode(encrypted).decode('utf-8'),
-                "iv": b64encode(iv).decode('utf-8'),
-                "ephemeral_public_key": b64encode(ephemeral_public_pem).decode('utf-8'),
-                "mac": b64encode(mac).decode('utf-8')
+                "encrypted": b64encode(ciphertext).decode('utf-8'),
+                "nonce": b64encode(nonce).decode('utf-8'),
+                "tag": b64encode(encryptor.tag).decode('utf-8'),
+                "ephemeral_public_key": b64encode(ephemeral_private.public_key().public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )).decode('utf-8')
             }
         except Exception as e:
             print(f"DEBUG - Error in encrypt_for_recipient: {e}")
@@ -673,29 +705,40 @@ class Client:
 
     def decrypt_location(self, encrypted_data):
         try:
+            # Load ephemeral public key
             ephemeral_public_key_pem = b64decode(encrypted_data["ephemeral_public_key"])
             ephemeral_public_key = serialization.load_pem_public_key(ephemeral_public_key_pem)
 
+            # Generate shared secret
             shared_key = self.private_key.exchange(
                 ec.ECDH(),
                 ephemeral_public_key
             )
 
-            derived_key = HKDF(
+            # Derive encryption key
+            encryption_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing',
+                info=b'location-sharing-encryption',
             ).derive(shared_key)
 
-            iv = b64decode(encrypted_data["iv"])
-            cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
+            # Decode components
+            nonce = b64decode(encrypted_data["nonce"])
+            ciphertext = b64decode(encrypted_data["encrypted"])
+            tag = b64decode(encrypted_data["tag"])
+
+            # Create GCM cipher
+            cipher = Cipher(
+                algorithms.AES(encryption_key),
+                modes.GCM(nonce, tag)
+            )
             decryptor = cipher.decryptor()
-            decrypted = decryptor.update(b64decode(encrypted_data["encrypted"]))
-            decrypted += decryptor.finalize()
-            unpadder = symmetric_padding.PKCS7(128).unpadder()
-            unpadded = unpadder.update(decrypted) + unpadder.finalize()
-            return json.loads(unpadded.decode())
+
+            # Decrypt and verify in one step
+            decrypted = decryptor.update(ciphertext) + decryptor.finalize()
+
+            return json.loads(decrypted.decode())
         except Exception as e:
             print(f"Error decrypting location data: {e}")
             raise
@@ -735,11 +778,17 @@ class Client:
         })
         self.send_message(request)
         response = json.loads(self.socket.recv(1024).decode("utf-8"))
+
         if response["type"] != "public_key_response":
             raise Exception("Failed to get public key")
-        public_key = serialization.load_pem_public_key(
-            b64decode(response["public_key"])
-        )
+
+        # Verify key timestamp
+        key_created = response["key_created"]
+        if not isinstance(key_created, int):
+            raise Exception("Invalid key timestamp")
+
+        public_key_pem = b64decode(response["public_key"])
+        return serialization.load_pem_public_key(public_key_pem)
 
     def send_friend_request(self, friend_username):
         message = json.dumps({
