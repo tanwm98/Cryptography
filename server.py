@@ -290,7 +290,9 @@ def handle_client(conn, addr, server_state: ServerState):
                                     server_state.save_friends()
                                     response = {"type": "friend_added", "friend_username": friend_to_add, "message": f"{friend_to_add} added to {user}'s friend list."}
                     conn.sendall(json.dumps(response).encode("utf-8"))
-
+                elif message_type == "view_friends":
+                    response_message = {"type": "view_friends", "friends": server_state.friends.get(message["username"], [])}
+                    conn.sendall(json.dumps(response_message).encode("utf-8"))
                 elif message_type == "friend_request":
                     from_user = message["from"]
                     to_user = message["to"]
@@ -358,7 +360,11 @@ def handle_client(conn, addr, server_state: ServerState):
                     session_to = server_state.get_client(to_user)
                     if session_to:
                         try:
-                            update = {"type": "view_friends", "friends": server_state.friends.get(to_user, [])}
+                            update = {
+                                "type": "view_friends",
+                                "friends": server_state.friends.get(to_user, []),
+                                "message": "Friend list updated after accepting request"
+                            }
                             session_to.connection.sendall(json.dumps(update).encode("utf-8"))
                         except Exception as e:
                             print(f"Error updating friend list: {e}")
@@ -387,28 +393,28 @@ def handle_client(conn, addr, server_state: ServerState):
                     messages = server_state.get_messages(username)
                     response = {"type": "queued_messages", "messages": messages}
                     conn.sendall(json.dumps(response).encode("utf-8"))
-                elif message_type == "update_location":
-                    username = message["username"]
-                    cell_x = message["cell_x"]
-                    cell_y = message["cell_y"]
-                    with server_state.users_lock:
-                        if username not in server_state.users:
-                            response = {"type": "error", "message": "User not found"}
-                        else:
-                            if 0 <= cell_x <= 99999 and 0 <= cell_y <= 99999:
-                                with server_state.clients_lock:
-                                    session = server_state.clients.get(username)
-                                    if session:
-                                        session.cell_x = cell_x
-                                        session.y = cell_y
-                                        response = {
-                                            "type": "location_update_success",
-                                            "message": "Location updated successfully"
-                                        }
-                                    else:
-                                        response = {"type": "error", "message": "User session not found"}
-                            else:
-                                response = {"type": "error", "message": "Coordinates out of bounds"}
+                # elif message_type == "update_location":
+                #     username = message["username"]
+                #     cell_x = message["cell_x"]
+                #     cell_y = message["cell_y"]
+                #     with server_state.users_lock:
+                #         if username not in server_state.users:
+                #             response = {"type": "error", "message": "User not found"}
+                #         else:
+                #             if 0 <= cell_x <= 99999 and 0 <= cell_y <= 99999:
+                #                 with server_state.clients_lock:
+                #                     session = server_state.clients.get(username)
+                #                     if session:
+                #                         session.cell_x = cell_x
+                #                         session.y = cell_y
+                #                         response = {
+                #                             "type": "location_update_success",
+                #                             "message": "Location updated successfully"
+                #                         }
+                #                     else:
+                #                         response = {"type": "error", "message": "User session not found"}
+                #             else:
+                #                 response = {"type": "error", "message": "Coordinates out of bounds"}
                     conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "get_public_key":
                     target_username = message["target"]

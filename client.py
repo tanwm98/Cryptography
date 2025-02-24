@@ -193,39 +193,22 @@ class Client:
             x = int(input("Enter your x coordinate (0-99999): "))
             y = int(input("Enter your y coordinate (0-99999): "))
             if 0 <= x <= 99999 and 0 <= y <= 99999:
+                print("\nDEBUG - Setting local location")
+                print(f"DEBUG - New coordinates: ({x}, {y})")
+
                 self.x = x
                 self.y = y
                 cell = self.grid_location.coordinates_to_cell(x, y)
-                # Send update to server
-                update_message = json.dumps({
-                    "type": "update_location",
-                    "username": self.username,
-                    "cell_x": cell[0],
-                    "cell_y": cell[1]
-                })
-                self.socket.sendall(update_message.encode("utf-8"))
+                print(f"DEBUG - New cell: ({cell[0]}, {cell[1]})")
+                print("DEBUG - Location updated locally")
+                return True
             else:
                 raise ValueError
         except ValueError:
             print("Those are not valid coordinates!")
+            return False
         except Exception as e:
             print(f"Something went wrong: {e}")
-
-    def send_secure_location_update(self, location_update):
-        # In this implementation, we simulate sending an update to the server.
-        # In practice, you might want to encrypt the location update similarly to send_location.
-        try:
-            message = json.dumps({
-                "type": "update_location",
-                "username": self.username,
-                "x": location_update["x"],
-                "y": location_update["y"],
-                "timestamp": location_update["timestamp"]
-            })
-            self.send_message(message)
-            return True
-        except Exception as e:
-            print(f"Failed to send location update: {e}")
             return False
 
     # --- Other Client Methods ---
@@ -339,7 +322,13 @@ class Client:
                     self.friends = message.get("friends", [])
                 elif message_type == "view_friends":
                     self.friends = message.get("friends", [])
-                    print(f"Friends list: {self.friends}")
+                    if self.friends:
+                        print("\nYour friends:", ", ".join(self.friends))
+                    else:
+                        print("\nYou have no friends yet.")
+                elif message_type == "friend_request_accepted":
+                    self.friends = message.get("friends", [])
+                    print("\nFriend list updated:", ", ".join(self.friends))
                 elif message_type == "received_message":
                     print(f"\nMessage from {message['from_client_id']}: {message['content']}")
                 elif message_type == "location_request":
@@ -382,55 +371,55 @@ class Client:
         print("Stopped receiving messages.")
         self.close()
 
-    def handle_message(self, message):
-        # Process incoming messages as before.
-        if message["type"] == "public_key_response":
-            # Store in cache if needed
-            pass  # Handled in get_public_key method
-        elif message["type"] == "registration_success":
-            print(message["message"])
-        elif message["type"] == "registration_failed":
-            print(message["message"])
-        elif message["type"] == "login_success":
-            print(message["message"])
-            self.username = message["username"]
-            self.is_logged_in = True
-            with self.friends_lock:
-                self.friends = message.get("friends", [])
-            session_key = b64decode(message["session_key"])
-            self.session_key = session_key
-            self.grid_location = SecureGridLocation()
-            self.grid_location.set_key(session_key)
-            print(f"Logged in as {self.username}. Friends: {self.friends}")
-        elif message["type"] == "login_failed":
-            print(message["message"])
-        elif message["type"] == "location_request":
-            from_client_id = message["from_client_id"]
-            self.send_location(from_client_id)
-        elif message["type"] == "location_data":
-            location = message["location"]
-            if self.proximity_check_cell(location):
-                print("Friend is nearby! (Same or Adjacent Cell)")
-            else:
-                print("Friend is not nearby!")
-        elif message["type"] == "error":
-            print(f"Error: {message['message']}")
-        elif message["type"] == "friend_added":
-            print(message["message"])
-            with self.friends_lock:
-                self.friends.append(message["message"].split()[0])
-        elif message["type"] == "view_friends":
-            with self.friends_lock:
-                self.friends = message.get("friends", [])
-            print(f"Friends: {self.friends}")
-        elif message["type"] == "message_user":
-            sender = message["from_client_id"]
-            message_data = message["content"]
-            print(f"{sender}: {message_data}")
-        elif message["type"] == "received_message":
-            sender = message["from_client_id"]
-            content = message["content"]
-            print(f"\nMessage from {sender}: {content}")
+    # def handle_message(self, message):
+    #     # Process incoming messages as before.
+    #     if message["type"] == "public_key_response":
+    #         # Store in cache if needed
+    #         pass  # Handled in get_public_key method
+    #     elif message["type"] == "registration_success":
+    #         print(message["message"])
+    #     elif message["type"] == "registration_failed":
+    #         print(message["message"])
+    #     elif message["type"] == "login_success":
+    #         print(message["message"])
+    #         self.username = message["username"]
+    #         self.is_logged_in = True
+    #         with self.friends_lock:
+    #             self.friends = message.get("friends", [])
+    #         session_key = b64decode(message["session_key"])
+    #         self.session_key = session_key
+    #         self.grid_location = SecureGridLocation()
+    #         self.grid_location.set_key(session_key)
+    #         print(f"Logged in as {self.username}. Friends: {self.friends}")
+    #     elif message["type"] == "login_failed":
+    #         print(message["message"])
+    #     elif message["type"] == "location_request":
+    #         from_client_id = message["from_client_id"]
+    #         self.send_location(from_client_id)
+    #     elif message["type"] == "location_data":
+    #         location = message["location"]
+    #         if self.proximity_check_cell(location):
+    #             print("Friend is nearby! (Same or Adjacent Cell)")
+    #         else:
+    #             print("Friend is not nearby!")
+    #     elif message["type"] == "error":
+    #         print(f"Error: {message['message']}")
+    #     elif message["type"] == "friend_added":
+    #         print(message["message"])
+    #         with self.friends_lock:
+    #             self.friends.append(message["message"].split()[0])
+    #     elif message["type"] == "view_friends":
+    #         with self.friends_lock:
+    #             self.friends = message.get("friends", [])
+    #         print(f"Friends: {self.friends}")
+    #     elif message["type"] == "message_user":
+    #         sender = message["from_client_id"]
+    #         message_data = message["content"]
+    #         print(f"{sender}: {message_data}")
+    #     elif message["type"] == "received_message":
+    #         sender = message["from_client_id"]
+    #         content = message["content"]
+    #         print(f"\nMessage from {sender}: {content}")
 
     def request_location(self, target_client_id):
         if not self.is_logged_in:
@@ -603,6 +592,7 @@ class Client:
             print(f"DEBUG - Error message: {str(e)}")
             print(f"DEBUG - Error location: {e.__traceback__.tb_frame.f_code.co_name}")
             return False
+
     def add_friend(self, friend_username):
         if not self.is_logged_in:
             print("You must log in before adding a friend.")
@@ -618,7 +608,7 @@ class Client:
         if not self.is_logged_in:
             print("You must log in before viewing friends.")
             return
-        message = json.dumps({"type": "view_friend", "username": self.username})
+        message = json.dumps({"type": "view_friends", "username": self.username})
         self.send_message(message)
 
     def msg_user(self, to_client_id, message_data):
