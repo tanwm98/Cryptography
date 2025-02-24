@@ -11,6 +11,7 @@ ph = PasswordHasher()
 
 # ----- Data Classes -----
 
+
 class ClientSession:
     def __init__(self, connection, username, public_key=None):
         self.connection = connection
@@ -19,13 +20,13 @@ class ClientSession:
         self.session_key = os.urandom(32)
         self.last_activity = time.time()
 
+
 class PendingRequest:
     def __init__(self, from_user, to_user):
         self.from_user = from_user
         self.to_user = to_user
         self.timestamp = time.time()
 
-# ----- ServerState Class -----
 
 class ServerState:
     def __init__(self, users_file="users.txt", friends_file="friends.txt"):
@@ -71,7 +72,7 @@ class ServerState:
                         self.users = json.load(f)
                 except Exception as e:
                     print(f"Error loading users: {e}")
-
+                    self.users = {}
     def load_friends(self):
         with self.friends_lock:
             self.friends = {}
@@ -129,18 +130,17 @@ class ServerState:
                 del self.clients[username]
                 print(f"Handled connection error for {username}")
 
-    def check_connection_alive(self, username):
-        with self.clients_lock:
-            session = self.clients.get(username)
-        if session:
-            try:
-                # Send a heartbeat (empty byte string)
-                session.connection.sendall(b'')
-                return True
-            except Exception:
-                self.handle_connection_error(username)
-                return False
-        return False
+    def handle_get_public_key(self, message):
+        target = message["target"]
+        with self.users_lock:
+            user_data = self.users.get(target)
+            if user_data and "public_key" in user_data:
+                return {
+                    "type": "public_key_response",
+                    "public_key": user_data["public_key"],
+                    "key_created": user_data["key_created"]
+                }
+            return {"type": "error", "message": "Public key not found"}
 
     # Pending requests
     def add_pending_request(self, to_user, request):
@@ -188,35 +188,36 @@ def handle_client(conn, addr, server_state: ServerState):
                 if message_type == "register":
                     username = message["username"]
                     password = message["password"]
+                    identity_pubkey = message["identity_public_key"]
+                    key_created = message.get("key_created", int(time.time()))
+
                     with server_state.users_lock:
                         if username in server_state.users:
                             response = {"type": "registration_failed", "message": "Username already exists."}
                         else:
                             try:
                                 hashed_password = ph.hash(password)
-                            except Exception:
-                                response = {"type": "registration_failed", "message": "Error hashing password."}
-                            else:
-                                server_state.users[username] = hashed_password
+                                # Store as dictionary instead of just password hash
+                                server_state.users[username] = {
+                                    "password": hashed_password,
+                                    "public_key": identity_pubkey,
+                                    "key_created": key_created
+                                }
                                 server_state.save_users()
-                                with server_state.friends_lock:
-                                    server_state.friends[username] = []
-                                    server_state.save_friends()
                                 response = {"type": "registration_success", "message": "Registration successful."}
-                    conn.sendall(json.dumps(response).encode("utf-8"))
-
+                            except Exception as e:
+                                response = {"type": "registration_failed", "message": f"Error during registration: {e}"}
+                        conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "login":
                     username = message["username"]
                     password = message["password"]
-                    public_key = message.get("public_key")
+                    session_public_key  = message.get("session_public_key")
                     with server_state.users_lock:
-                        if username in server_state.users:
+                        user_data = server_state.users.get(username)
+                        if user_data and "password" in user_data:
                             try:
-                                ph.verify(server_state.users[username], password)
-                            except Exception:
-                                response = {"type": "login_failed", "message": "Invalid username or password."}
-                            else:
-                                session = ClientSession(conn, username, public_key)
+                                ph.verify(user_data["password"], password)
+                                session = ClientSession(conn, username, session_public_key)
                                 server_state.add_client(username, session)
                                 with server_state.friends_lock:
                                     friend_list = server_state.friends.get(username, [])
@@ -227,6 +228,8 @@ def handle_client(conn, addr, server_state: ServerState):
                                     "friends": friend_list,
                                     "session_key": b64encode(session.session_key).decode("utf-8")
                                 }
+                            except Exception:
+                                response = {"type": "login_failed", "message": "Invalid username or password."}
                         else:
                             response = {"type": "login_failed", "message": "Invalid username or password."}
                     conn.sendall(json.dumps(response).encode("utf-8"))
@@ -417,19 +420,17 @@ def handle_client(conn, addr, server_state: ServerState):
                 #                 response = {"type": "error", "message": "Coordinates out of bounds"}
                     conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "get_public_key":
-                    target_username = message["target"]
-                    with server_state.clients_lock:
-                        target_session = server_state.clients.get(target_username)
-                        if target_session and target_session.public_key:
-                            # Ensure the public key is sent as a string
-                            if isinstance(target_session.public_key, bytes):
-                                pubkey_str = target_session.public_key.decode("utf-8")
-                            else:
-                                pubkey_str = target_session.public_key
-                            response = {"type": "public_key_response", "target": target_username,
-                                        "public_key": pubkey_str}
+                    target = message["target"]
+                    with server_state.users_lock:
+                        user_data = server_state.users.get(target)
+                        if user_data and "public_key" in user_data:
+                            response = {
+                                "type": "public_key_response",
+                                "public_key": user_data["public_key"],
+                                "key_created": user_data["key_created"]
+                            }
                         else:
-                            response = {"type": "error", "message": "Public key not found."}
+                            response = {"type": "error", "message": "Public key not found"}
                     conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "get_friend_requests":
                     username = message["username"]
