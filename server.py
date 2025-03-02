@@ -9,6 +9,8 @@ from threading import RLock
 
 ph = PasswordHasher()
 
+PORT = 65432
+
 # ----- Data Classes -----
 
 
@@ -232,6 +234,12 @@ def handle_client(conn, addr, server_state: ServerState):
                                 response = {"type": "login_failed", "message": "Invalid username or password."}
                         else:
                             response = {"type": "login_failed", "message": "Invalid username or password."}
+                            
+                        try:
+                            server_state.users[username]["public_key"] = message['public_key']
+                            server_state.save_users()
+                        except Exception as e:
+                            response = {"type": "login_success", "message": f"Error during login: {e}"}
                     conn.sendall(json.dumps(response).encode("utf-8"))
 
                 elif message_type == "request_location":
@@ -396,28 +404,6 @@ def handle_client(conn, addr, server_state: ServerState):
                     messages = server_state.get_messages(username)
                     response = {"type": "queued_messages", "messages": messages}
                     conn.sendall(json.dumps(response).encode("utf-8"))
-                # elif message_type == "update_location":
-                #     username = message["username"]
-                #     cell_x = message["cell_x"]
-                #     cell_y = message["cell_y"]
-                #     with server_state.users_lock:
-                #         if username not in server_state.users:
-                #             response = {"type": "error", "message": "User not found"}
-                #         else:
-                #             if 0 <= cell_x <= 99999 and 0 <= cell_y <= 99999:
-                #                 with server_state.clients_lock:
-                #                     session = server_state.clients.get(username)
-                #                     if session:
-                #                         session.cell_x = cell_x
-                #                         session.y = cell_y
-                #                         response = {
-                #                             "type": "location_update_success",
-                #                             "message": "Location updated successfully"
-                #                         }
-                #                     else:
-                #                         response = {"type": "error", "message": "User session not found"}
-                #             else:
-                #                 response = {"type": "error", "message": "Coordinates out of bounds"}
                     conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "get_public_key":
                     target = message["target"]
@@ -493,7 +479,7 @@ def session_cleanup_task(server_state, timeout=3600, interval=60):
 
 
 # ----- Server Startup -----
-def start_server(server_state, host="127.0.0.1", port=65432):
+def start_server(server_state, host="127.0.0.1", port=PORT):
     cleanup_thread = threading.Thread(target=session_cleanup_task, args=(server_state,), daemon=True)
     cleanup_thread.start()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

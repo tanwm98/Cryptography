@@ -18,7 +18,7 @@ ph = PasswordHasher()
 # Client configuration
 HOST = "127.0.0.1"
 PORT = 65432
-EUCLIDEAN_DISTANCE = 10000
+EUCLIDEAN_DISTANCE = 1414 # (1414 == same cell)
 
 
 class NetworkError(Exception):
@@ -88,16 +88,15 @@ class SecureGridLocation:
         return (x // self.resolution, y // self.resolution)
 
     def generate_cell_proof(self, x, y, timestamp, key):
-        cell = self.coordinates_to_cell(x, y)
         h = hmac.HMAC(key, hashes.SHA256())
-        msg = f"{cell[0]},{cell[1]},{timestamp}".encode()
+        msg = f"{x},{y},{timestamp}".encode()
         h.update(msg)
         return b64encode(h.finalize()).decode('utf-8')
 
-    def verify_cell_proof(self, cell_x, cell_y, proof, timestamp, key):
+    def verify_cell_proof(self, coord_x, coord_y, proof, timestamp, key):
         try:
             print("\nDEBUG - Starting cell proof verification")
-            print(f"DEBUG - Checking cell ({cell_x}, {cell_y})")
+            print(f"DEBUG - Checking cell ({coord_x}, {coord_y})")
             print(f"DEBUG - Timestamp: {timestamp}")
 
             # Add timestamp freshness check
@@ -108,7 +107,7 @@ class SecureGridLocation:
                 return False
 
             h = hmac.HMAC(key, hashes.SHA256())
-            msg = f"{cell_x},{cell_y},{timestamp}".encode()
+            msg = f"{coord_x},{coord_y},{timestamp}".encode()
             print(f"DEBUG - Verification message: {msg}")
 
             h.update(msg)
@@ -358,10 +357,12 @@ class Client:
                 elif message_type == "location_data":
                     location = message["location"]
                     is_nearby, is_same_cell = self.proximity_check_cell(location)
-                    if is_same_cell:
-                        print("Friend is nearby! (Same Cell)")
+                    if is_same_cell and is_nearby:
+                        print("Friend is nearby! (Same Cell and within EUCLIDEAN_DISTANCE range)")
                     elif is_nearby:
-                        print("Friend is nearby! (Adjacent Cell)")
+                        print("Friend is nearby! (within EUCLIDEAN_DISTANCE range)")
+                    elif is_same_cell:
+                        print("Friend is nearby! (Same Cell)")
                     else:
                         print("Friend is not nearby!")
                 elif message_type == "error":
@@ -395,56 +396,6 @@ class Client:
         print("Stopped receiving messages.")
         self.close()
 
-    # def handle_message(self, message):
-    #     # Process incoming messages as before.
-    #     if message["type"] == "public_key_response":
-    #         # Store in cache if needed
-    #         pass  # Handled in get_public_key method
-    #     elif message["type"] == "registration_success":
-    #         print(message["message"])
-    #     elif message["type"] == "registration_failed":
-    #         print(message["message"])
-    #     elif message["type"] == "login_success":
-    #         print(message["message"])
-    #         self.username = message["username"]
-    #         self.is_logged_in = True
-    #         with self.friends_lock:
-    #             self.friends = message.get("friends", [])
-    #         session_key = b64decode(message["session_key"])
-    #         self.session_key = session_key
-    #         self.grid_location = SecureGridLocation()
-    #         self.grid_location.set_key(session_key)
-    #         print(f"Logged in as {self.username}. Friends: {self.friends}")
-    #     elif message["type"] == "login_failed":
-    #         print(message["message"])
-    #     elif message["type"] == "location_request":
-    #         from_client_id = message["from_client_id"]
-    #         self.send_location(from_client_id)
-    #     elif message["type"] == "location_data":
-    #         location = message["location"]
-    #         if self.proximity_check_cell(location):
-    #             print("Friend is nearby! (Same or Adjacent Cell)")
-    #         else:
-    #             print("Friend is not nearby!")
-    #     elif message["type"] == "error":
-    #         print(f"Error: {message['message']}")
-    #     elif message["type"] == "friend_added":
-    #         print(message["message"])
-    #         with self.friends_lock:
-    #             self.friends.append(message["message"].split()[0])
-    #     elif message["type"] == "view_friends":
-    #         with self.friends_lock:
-    #             self.friends = message.get("friends", [])
-    #         print(f"Friends: {self.friends}")
-    #     elif message["type"] == "message_user":
-    #         sender = message["from_client_id"]
-    #         message_data = message["content"]
-    #         print(f"{sender}: {message_data}")
-    #     elif message["type"] == "received_message":
-    #         sender = message["from_client_id"]
-    #         content = message["content"]
-    #         print(f"\nMessage from {sender}: {content}")
-
     def request_location(self, target_client_id):
         if not self.is_logged_in:
             print("You must log in before requesting a location.")
@@ -470,7 +421,6 @@ class Client:
             return
         try:
             timestamp = int(time.time())
-            cell = self.grid_location.coordinates_to_cell(self.x, self.y)
 
             # Get recipient's public key first
             try:
@@ -478,14 +428,15 @@ class Client:
             except Exception as e:
                 print(f"Failed to get verified public key: {e}")
                 return
-
+            
             # Generate ephemeral key and derive shared key
             ephemeral_private = ec.generate_private_key(ec.SECP256K1())
+            
             shared_key = ephemeral_private.exchange(
                 ec.ECDH(),
                 recipient_public_key
             )
-
+            
             # Derive key for both encryption and proof
             derived_key = HKDF(
                 algorithm=hashes.SHA256(),
@@ -496,8 +447,8 @@ class Client:
 
             # Generate location data with proof using derived key
             location_data = {
-                "cell_x": cell[0],
-                "cell_y": cell[1],
+                "coord_x": self.x,
+                "coord_y": self.y,
                 "timestamp": timestamp,
                 "proof": self.grid_location.generate_cell_proof(self.x, self.y, timestamp, derived_key)
             }
@@ -527,7 +478,7 @@ class Client:
             ephemeral_public_key_pem = b64decode(encrypted_location["ephemeral_public_key"])
             ephemeral_public_key = serialization.load_pem_public_key(ephemeral_public_key_pem)
             print("DEBUG - ✓ Ephemeral key loaded successfully")
-
+         
             # Step 2: Generate shared key
             print("DEBUG - 2. Generating shared key...")
             shared_key = self.private_key.exchange(
@@ -535,7 +486,7 @@ class Client:
                 ephemeral_public_key
             )
             print("DEBUG - ✓ Shared key generated")
-
+            
             # Step 3: Derive separate keys
             print("DEBUG - 3. Deriving separate keys using HKDF...")
             encryption_key = HKDF(
@@ -544,7 +495,7 @@ class Client:
                 salt=None,
                 info=b'location-sharing-encryption',
             ).derive(shared_key)
-
+            
             proof_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
@@ -559,7 +510,7 @@ class Client:
                 nonce = b64decode(encrypted_location["nonce"])
                 ciphertext = b64decode(encrypted_location["encrypted"])
                 tag = b64decode(encrypted_location["tag"])
-
+                
                 cipher = Cipher(
                     algorithms.AES(encryption_key),
                     modes.GCM(nonce, tag)
@@ -576,8 +527,8 @@ class Client:
             print("DEBUG - 5. Verifying location proof...")
             try:
                 if not self.grid_location.verify_cell_proof(
-                        location["cell_x"],
-                        location["cell_y"],
+                        location["coord_x"],
+                        location["coord_y"],
                         location["proof"],
                         location["timestamp"],
                         proof_key  # Use proof_key here
@@ -591,17 +542,28 @@ class Client:
 
             # Step 6: Check proximity
             print("DEBUG - 6. Checking cell proximity...")
+            is_same_cell = False
             my_cell = self.grid_location.coordinates_to_cell(self.x, self.y)
-            their_cell = (location["cell_x"], location["cell_y"])
+            their_cell = self.grid_location.coordinates_to_cell(location["coord_x"], location["coord_y"])
             dx = abs(my_cell[0] - their_cell[0])
             dy = abs(my_cell[1] - their_cell[1])
 
             print(f"DEBUG - My cell: {my_cell}")
             print(f"DEBUG - Their cell: {their_cell}")
             print(f"DEBUG - Cell distance: dx={dx}, dy={dy}")
+            
+            # Calculcate Euclidean Distance between locations
+            x1, y1 = self.x, self.y
+            x2, y2 = location["coord_x"], location["coord_y"]
+            distance = sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            print(f"DEBUG - Euclidean distance: {distance}")
+            
+            if distance <= EUCLIDEAN_DISTANCE:
+                is_nearby = True
+            else:
+                is_nearby = False
 
             is_same_cell = dx == 0 and dy == 0
-            is_nearby = dx <= 1 and dy <= 1
             return is_nearby, is_same_cell
 
         except Exception as e:
@@ -689,7 +651,7 @@ class Client:
             # Convert data to bytes and encrypt
             data_bytes = json.dumps(data).encode()
             ciphertext = encryptor.update(data_bytes) + encryptor.finalize()
-
+            
             return {
                 "encrypted": b64encode(ciphertext).decode('utf-8'),
                 "nonce": b64encode(nonce).decode('utf-8'),
