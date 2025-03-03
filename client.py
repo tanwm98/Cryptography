@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64encode, b64decode
 from argon2 import PasswordHasher
+import time
 
 ph = PasswordHasher()
 
@@ -358,7 +359,14 @@ class Client:
                     self.send_location(from_client_id)
                 elif message_type == "location_data":
                     location = message["location"]
+
+                    start_time = time.time()  # Start timer
                     is_nearby, is_same_cell = self.proximity_check_cell(location)
+                    end_time = time.time()  # End timer
+                    print(f"Proximity check took {end_time - start_time:.6f} seconds")
+
+
+
                     if is_same_cell and is_nearby:
                         print("Friend is nearby! (Same Cell and within EUCLIDEAN_DISTANCE range)")
                     elif is_nearby:
