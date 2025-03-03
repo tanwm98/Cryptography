@@ -16,7 +16,7 @@ from argon2 import PasswordHasher
 ph = PasswordHasher()
 
 # Client configuration
-HOST = "127.0.0.1"
+HOST = "172.30.138.8"
 PORT = 65432
 EUCLIDEAN_DISTANCE = 1414 # (1414 == same cell)
 
@@ -144,6 +144,7 @@ class Client:
         self.friends_lock = threading.RLock()
         self.message_queue_lock = threading.RLock()
         self.connection_lock = threading.RLock()
+        self.stop_flag = threading.Event()  # Flag to signal the thread to stop
         # Use an instance of MessageQueue for queued messages
         self.message_queue = MessageQueue()
 
@@ -301,6 +302,7 @@ class Client:
             try:
                 data = self.socket.recv(1024).decode("utf-8")
                 if not data:
+                    self.stop_flag.set()
                     print("Server connection closed")
                     self.is_running = False
                     break
