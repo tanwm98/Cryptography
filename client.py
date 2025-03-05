@@ -1,18 +1,17 @@
 import socket
 import json
 import threading
-import time
-from math import sqrt
 import os
 from cryptography.exceptions import InvalidKey
 from cryptography.hazmat.primitives import serialization, hashes, hmac
-from cryptography.hazmat.primitives import padding as symmetric_padding
 from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding, ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64encode, b64decode
 from argon2 import PasswordHasher
 import time
+from elgamal import ECElGamal, serialize_public_key, deserialize_public_key, encrypt_to_json, json_to_encrypt, pierre_proximity_check
+import random
 
 ph = PasswordHasher()
 
@@ -78,59 +77,33 @@ class Config:
                 raise e
 
 
-# --- SecureGridLocation remains largely the same ---
 class SecureGridLocation:
     def __init__(self, resolution=1000):
+        """
+        Initialize with a resolution
+
+        Args:
+            resolution: Grid cell size (default 1000)
+        """
         self.resolution = resolution
+        self.key = None
 
     def coordinates_to_cell(self, x, y):
-        return (x // self.resolution, y // self.resolution)
+        """Convert exact coordinates to grid cell coordinates"""
+        cell_x = x // self.resolution
+        cell_y = y // self.resolution
+        return (cell_x, cell_y)
 
-    def generate_cell_proof(self, x, y, timestamp, key):
-        h = hmac.HMAC(key, hashes.SHA256())
-        msg = f"{x},{y},{timestamp}".encode()
-        h.update(msg)
-        return b64encode(h.finalize()).decode("utf-8")
-
-    def verify_cell_proof(self, coord_x, coord_y, proof, timestamp, key):
-        try:
-            print("\nDEBUG - Starting cell proof verification")
-            print(f"DEBUG - Checking cell ({coord_x}, {coord_y})")
-            print(f"DEBUG - Timestamp: {timestamp}")
-
-            # Add timestamp freshness check
-            current_time = int(time.time())
-            max_age = 30  # 30 seconds
-            if abs(current_time - timestamp) > max_age:
-                print(
-                    f"DEBUG - ✗ Timestamp too old: {current_time - timestamp} seconds"
-                )
-                return False
-
-            h = hmac.HMAC(key, hashes.SHA256())
-            msg = f"{coord_x},{coord_y},{timestamp}".encode()
-            print(f"DEBUG - Verification message: {msg}")
-
-            h.update(msg)
-            try:
-                h.verify(b64decode(proof))
-                print("DEBUG - ✓ Cell proof verification successful")
-                return True
-            except InvalidKey:
-                print("DEBUG - ✗ Cell proof verification failed - Invalid key")
-                return False
-            except Exception as e:
-                print(f"DEBUG - ✗ Cell proof verification failed: {e}")
-                return False
-
-        except Exception as e:
-            print(f"DEBUG - ✗ Error in verify_cell_proof: {e}")
-            return False
+    def set_key(self, key):
+        """Set encryption key"""
+        self.key = key
 
 
 # --- Updated Client Class with Thread Safety and Enhanced Error Handling ---
 class Client:
     def __init__(self):
+        self.temp_private_key = None  # For storing temporary ElGamal private key
+        self.last_request_data = None  # For storing location requests
         self.username = None
         self.x = 0
         self.y = 0
@@ -362,17 +335,23 @@ class Client:
                     )
                 elif message_type == "location_request":
                     from_client_id = message["from_client_id"]
-                    self.send_location(from_client_id)
+                    # Store the last request for use in send_location
+                    # Only update if request_data is present
+                    if "request_data" in message:
+                        self.last_request_data = message.get("request_data", {})
+                        print(f"Stored location request data from {from_client_id}")
+                        self.send_location(from_client_id)
+                    else:
+                        print(f"Received location request without data from {from_client_id}")
                 elif message_type == "location_data":
                     location = message["location"]
-
                     start_time = time.time()  # Start timer
                     is_same_cell = self.proximity_check_cell(location)
                     end_time = time.time()  # End timer
                     print(f"Proximity check took {end_time - start_time:.6f} seconds")
 
                     if is_same_cell:
-                        print("Friend is nearby! (Same Cell)")
+                        print("Friend is nearby!")
                     else:
                         print("Friend is not nearby!")
                 elif message_type == "error":
@@ -410,173 +389,149 @@ class Client:
         if not self.is_logged_in:
             print("You must log in before requesting a location.")
             return
-        if target_client_id == self.username:
-            print(
-                f"Your current location is ({self.x}, {self.y}) in cell ({self.x // 1000}, {self.y // 1000})"
-            )
+
+        if target_client_id not in self.friends:
+            print(f"You must be friends with {target_client_id} to request their location.")
             return
-        with self.friends_lock:
-            if target_client_id not in self.friends:
-                print("You must be friends to view their location.")
-                return
-        request_message = json.dumps(
-            {
-                "type": "request_location",
-                "client_id": self.username,
-                "target_client_id": target_client_id,
-            }
-        )
+        elif target_client_id == self.username:
+            print("You cannot request your own location.")
+            return
+
+        # Convert to grid coordinates
+        my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
+        print(f"My cell coordinates: ({my_cell_x}, {my_cell_y})")
+
+        # Generate EC ElGamal keypair for this request
+        elgamal = ECElGamal()
+        public_key, private_key = elgamal.generate_keys()
+        self.temp_private_key = private_key  # Store for decryption
+
+        # Encrypt my cell coordinates
+        encrypted_x = elgamal.encrypt(public_key, my_cell_x)
+        encrypted_y = elgamal.encrypt(public_key, my_cell_y)
+
+        # Create timestamp for freshness
+        timestamp = int(time.time())
+
+        # Create request data
+        request_data = {
+            "public_key": serialize_public_key(public_key),
+            "encrypted_coordinates": {
+                "x": encrypt_to_json(encrypted_x),
+                "y": encrypt_to_json(encrypted_y)
+            },
+            "timestamp": timestamp,
+            "resolution": self.grid_location.resolution  # Share grid resolution
+        }
+
+        # Create the request message
+        request_message = json.dumps({
+            "type": "request_location",
+            "client_id": self.username,
+            "target_client_id": target_client_id,
+            "request_data": request_data
+        })
+
         self.send_message(request_message)
-        print(f"Requested location from client {target_client_id}")
+        print(f"Location request sent to {target_client_id}")
 
-    def send_location(self, to_client_id):
-        if not self.grid_location:
-            print("Error: Grid location system not initialized")
-            return
+    def send_location(self, from_client_id):
         try:
-            timestamp = int(time.time())
-
-            # Get recipient's public key first
-            try:
-                recipient_public_key = self.get_public_key(to_client_id)
-            except Exception as e:
-                print(f"Failed to get verified public key: {e}")
+            # Get the request data from the received message
+            if not hasattr(self, "last_request_data") or not self.last_request_data:
+                print("No location request data available")
                 return
 
-            # Generate ephemeral key and derive shared key
-            ephemeral_private = ec.generate_private_key(ec.SECP256K1())
+            request_data = self.last_request_data
 
-            shared_key = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
+            # Check timestamp freshness
+            current_time = int(time.time())
+            if abs(current_time - request_data.get("timestamp", 0)) > 30:
+                print("Request too old")
+                return
 
-            # Derive key for both encryption and proof
-            derived_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing",
-            ).derive(shared_key)
+            # Initialize EC ElGamal
+            elgamal = ECElGamal()
 
-            # Generate location data with proof using derived key
+            # Get requestor's public key
+            public_key = deserialize_public_key(request_data["public_key"])
+
+            # Get my cell coordinates
+            my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
+
+            # Compute proximity check result - send my cell information
+            # (simplified version of Pierre protocol)
+            proximity_result = elgamal.compute_proximity_check(my_cell_x, my_cell_y, public_key)
+
+            # Create response with timestamp
+            timestamp = int(time.time())
             location_data = {
-                "coord_x": self.x,
-                "coord_y": self.y,
+                "proximity_results": {
+                    "same_cell": encrypt_to_json(proximity_result)
+                },
                 "timestamp": timestamp,
-                "proof": self.grid_location.generate_cell_proof(
-                    self.x, self.y, timestamp, derived_key
-                ),
+                "from_client_id": self.username
             }
 
-            # Encrypt location data
-            encrypted_location = self.encrypt_for_recipient(
-                to_client_id, location_data, ephemeral_private, recipient_public_key
-            )
+            # Send response
+            response_message = json.dumps({
+                "type": "location_response",
+                "to_client_id": from_client_id,
+                "location": location_data
+            })
 
-            response_message = json.dumps(
-                {
-                    "type": "location_response",
-                    "to_client_id": to_client_id,
-                    "location": encrypted_location,
-                }
-            )
             self.send_message(response_message)
+            print(f"Location response sent to {from_client_id} (Pierre protocol)")
 
         except Exception as e:
-            print(f"DEBUG - Error in send_location: {e}")
+            print(f"Error in send_location: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def proximity_check_cell(self, encrypted_location):
+    def proximity_check_cell(self, location_data):
         try:
-            print("\nDEBUG - Starting proximity check with detailed logging")
-            print(
-                f"DEBUG - My current location: cell ({self.x // 1000}, {self.y // 1000})"
-            )
-            print("DEBUG - Steps:")
+            # Get the proximity results from the response
+            proximity_results = location_data.get("proximity_results", {})
 
-            # Step 1: Load ephemeral key
-            print("DEBUG - 1. Loading ephemeral public key...")
-            ephemeral_public_key_pem = b64decode(
-                encrypted_location["ephemeral_public_key"]
-            )
-            ephemeral_public_key = serialization.load_pem_public_key(
-                ephemeral_public_key_pem
-            )
-            print("DEBUG - ✓ Ephemeral key loaded successfully")
-
-            # Step 2: Generate shared key
-            print("DEBUG - 2. Generating shared key...")
-            shared_key = self.private_key.exchange(ec.ECDH(), ephemeral_public_key)
-            print("DEBUG - ✓ Shared key generated")
-
-            # Step 3: Derive separate keys
-            print("DEBUG - 3. Deriving separate keys using HKDF...")
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            proof_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-proof",
-            ).derive(shared_key)
-            print("DEBUG - ✓ Keys derived successfully")
-
-            # Step 4: Decrypt with GCM
-            print("DEBUG - 4. Starting GCM decryption and authentication...")
-            try:
-                nonce = b64decode(encrypted_location["nonce"])
-                ciphertext = b64decode(encrypted_location["encrypted"])
-                tag = b64decode(encrypted_location["tag"])
-
-                cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce, tag))
-                decryptor = cipher.decryptor()
-                decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-                location = json.loads(decrypted.decode())
-                print("DEBUG - ✓ GCM authentication and decryption successful")
-            except Exception as e:
-                print(f"DEBUG - ✗ GCM authentication or decryption failed: {e}")
+            if not proximity_results:
+                print("Missing proximity results in response")
                 return False
 
-            # Step 5: Verify proof using proof_key
-            print("DEBUG - 5. Verifying location proof...")
-            try:
-                if not self.grid_location.verify_cell_proof(
-                    location["coord_x"],
-                    location["coord_y"],
-                    location["proof"],
-                    location["timestamp"],
-                    proof_key,  # Use proof_key here
-                ):
-                    print("DEBUG - ✗ Location proof verification failed")
-                    return False, False
-                print("DEBUG - ✓ Location proof verified")
-            except Exception as e:
-                print(f"DEBUG - ✗ Error during proof verification: {e}")
+            # Check timestamp freshness
+            current_time = int(time.time())
+            if abs(current_time - location_data["timestamp"]) > 30:
+                print("Response too old")
                 return False
 
-            # Step 6: Check proximity
-            print("DEBUG - 6. Checking cell proximity...")
-            is_same_cell = False
-            my_cell = self.grid_location.coordinates_to_cell(self.x, self.y)
-            their_cell = self.grid_location.coordinates_to_cell(
-                location["coord_x"], location["coord_y"]
-            )
-            dx = abs(my_cell[0] - their_cell[0])
-            dy = abs(my_cell[1] - their_cell[1])
+            # Initialize EC ElGamal
+            elgamal = ECElGamal()
 
-            print(f"DEBUG - My cell: {my_cell}")
-            print(f"DEBUG - Their cell: {their_cell}")
+            # Decrypt the cell identifier from the other user
+            same_cell_result = json_to_encrypt(proximity_results["same_cell"])
+            other_cell_id = elgamal.decrypt(self.temp_private_key, same_cell_result)
 
-            is_same_cell = dx == 0 and dy == 0
-            return is_same_cell
+            # Extract their cell coordinates
+            other_cell_x = (other_cell_id - 1) // 1000
+            other_cell_y = (other_cell_id - 1) % 1000
+
+            # Get my cell coordinates
+            my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
+
+            # Check if we're in the same cell
+            is_nearby = (my_cell_x == other_cell_x and my_cell_y == other_cell_y)
+
+            if is_nearby:
+                print("✓ Friend is nearby!")
+                return True
+            else:
+                print(
+                    f"✗ Friend is not nearby!")
+                return False
 
         except Exception as e:
-            print("\nDEBUG - Unexpected error in proximity_check_cell:")
-            print(f"DEBUG - Error type: {type(e).__name__}")
-            print(f"DEBUG - Error message: {str(e)}")
-            print(f"DEBUG - Error location: {e.__traceback__.tb_frame.f_code.co_name}")
+            print(f"Error in proximity check: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def add_friend(self, friend_username):
@@ -707,20 +662,17 @@ class Client:
     def sign_message(self, message):
         if not self.private_key:
             raise ValueError("No private key available - not logged in?")
-        signature = self.private_key.sign(
-            json.dumps(message).encode(),
-            asymmetric_padding.PSS(
-                mgf=asymmetric_padding.MGF1(hashes.SHA256()),
-                salt_length=asymmetric_padding.PSS.MAX_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
-        return b64encode(signature).decode("utf-8")
 
-    def verify_signature(self, message, signature, sender_public_key):
-        try:
-            sender_public_key.verify(
-                b64decode(signature),
+        # Check if it's an EC key
+        if isinstance(self.private_key, ec.EllipticCurvePrivateKey):
+            # EC keys use a different signing mechanism
+            signature = self.private_key.sign(
+                json.dumps(message).encode(),
+                ec.ECDSA(hashes.SHA256())
+            )
+        else:
+            # RSA keys use PSS padding
+            signature = self.private_key.sign(
                 json.dumps(message).encode(),
                 asymmetric_padding.PSS(
                     mgf=asymmetric_padding.MGF1(hashes.SHA256()),
@@ -728,6 +680,28 @@ class Client:
                 ),
                 hashes.SHA256(),
             )
+
+        return b64encode(signature).decode("utf-8")
+
+    def verify_signature(self, message, signature, sender_public_key):
+        try:
+            # Check if it's an EC key
+            if isinstance(sender_public_key, ec.EllipticCurvePublicKey):
+                sender_public_key.verify(
+                    b64decode(signature),
+                    json.dumps(message).encode(),
+                    ec.ECDSA(hashes.SHA256())
+                )
+            else:
+                sender_public_key.verify(
+                    b64decode(signature),
+                    json.dumps(message).encode(),
+                    asymmetric_padding.PSS(
+                        mgf=asymmetric_padding.MGF1(hashes.SHA256()),
+                        salt_length=asymmetric_padding.PSS.MAX_LENGTH,
+                    ),
+                    hashes.SHA256(),
+                )
             return True
         except Exception:
             return False

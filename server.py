@@ -179,7 +179,7 @@ def handle_client(conn, addr, server_state: ServerState):
     username = None
     try:
         while True:
-            data = conn.recv(1024).decode("utf-8")
+            data = conn.recv(4096).decode("utf-8")
             if not data:
                 break  # Connection closed by client
 
@@ -246,6 +246,7 @@ def handle_client(conn, addr, server_state: ServerState):
                 elif message_type == "request_location":
                     target_client_id = message["target_client_id"]
                     requesting_client_id = message["client_id"]
+                    request_data = message.get("request_data", {})
 
                     # Add friendship check
                     with server_state.friends_lock:
@@ -253,18 +254,25 @@ def handle_client(conn, addr, server_state: ServerState):
                                 target_client_id not in server_state.friends.get(requesting_client_id, [])):
                             response = {"type": "error", "message": "You must be friends to request location"}
                             conn.sendall(json.dumps(response).encode("utf-8"))
-                            return
+                            continue  # Use continue instead of return to keep connection open
 
-                    # Update grid size to 100x100
+                    # Forward the request if users are friends
                     target_session = server_state.get_client(target_client_id)
                     if target_session:
-                        request_message = {"type": "location_request", "from_client_id": requesting_client_id}
+                        request_message = {
+                            "type": "location_request",
+                            "from_client_id": requesting_client_id,
+                            "request_data": request_data  # Include the complete request data
+                        }
                         try:
                             target_session.connection.sendall(json.dumps(request_message).encode("utf-8"))
                             print(f"Sent location request to client {target_client_id}")
                         except Exception as e:
                             print(f"Error notifying location request: {e}")
                             server_state.handle_connection_error(target_client_id)
+                    else:
+                        response = {"type": "error", "message": f"User {target_client_id} is offline."}
+                        conn.sendall(json.dumps(response).encode("utf-8"))
 
                 elif message_type == "location_response":
                     requesting_client_id = message["to_client_id"]
