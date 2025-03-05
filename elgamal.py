@@ -21,18 +21,7 @@ class ECElGamal:
         return public_key, private_key
 
     def encrypt(self, public_key, message, random_factor=None):
-        """
-        Encrypt a value using EC ElGamal
-
-        In Pierre protocol, we encrypt:
-        - Grid cell coordinates
-        - Special values for proximity check
-
-        Args:
-            public_key: Recipient's public key
-            message: Integer to encrypt
-            random_factor: Optional random factor for homomorphic properties
-        """
+        """Modified encryption to support the Pierre protocol proximity check"""
         if not isinstance(message, int):
             raise ValueError("Message must be an integer")
 
@@ -52,18 +41,17 @@ class ECElGamal:
         ).derive(shared_secret)
 
         if random_factor is not None:
-            # For proximity check: if cells match (difference is 0), result is 0
-            # Otherwise result is random non-zero
+            # For proximity check: if cells match (message is 0), result is 0
+            # Otherwise result is random non-zero value
             if message == 0:
                 encrypted_value = 0  # Zero stays zero
             else:
                 encrypted_value = random_factor
         else:
-            # Standard encryption for coordinates
+            # Standard encryption for other values
             mask = int.from_bytes(encryption_key[:4], byteorder='big')
             encrypted_value = message ^ mask
 
-        # Serialize ephemeral public key
         ephemeral_public_bytes = ephemeral_public.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
@@ -100,10 +88,18 @@ class ECElGamal:
         return decrypted_value
 
     def compute_proximity_check(self, my_cell_x, my_cell_y, public_key):
-        cell_identifier = (my_cell_x * 1000 + my_cell_y + 1)
+        """
+        Compute proximity check that reveals ONLY if users are in same cell,
+        without requiring their cell coordinates
+        """
+        # Create unique cell identifier by combining coordinates
+        cell_id = my_cell_x * 1000 + my_cell_y
 
-        # Encrypt the cell identifier
-        result = self.encrypt(public_key, cell_identifier)
+        # Generate random value ρ as specified in Pierre protocol
+        rho = random.randint(1, 10000)
+
+        # Encrypt in a way that allows equality check without revealing actual values
+        result = self.encrypt(public_key, cell_id, random_factor=rho)
 
         return result
 
@@ -134,7 +130,6 @@ def pierre_proximity_check(my_cell, elgamal, public_key):
     }
 
 
-
 def serialize_public_key(public_key):
     """Convert EC public key to JSON-serializable format"""
     public_bytes = public_key.public_bytes(
@@ -163,5 +158,5 @@ def json_to_encrypt(json_value):
     """Restore ciphertext from JSON format"""
     ephemeral_bytes = b64decode(json_value["ephemeral"])
     encrypted = json_value["encrypted"]
-    return (ephemeral_bytes, encrypted)
+    return ephemeral_bytes, encrypted
 

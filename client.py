@@ -506,27 +506,19 @@ class Client:
             # Initialize EC ElGamal
             elgamal = ECElGamal()
 
-            # Decrypt the cell identifier from the other user
+            # Decrypt result - will be 0 if same cell, random if different cells
             same_cell_result = json_to_encrypt(proximity_results["same_cell"])
-            other_cell_id = elgamal.decrypt(self.temp_private_key, same_cell_result)
+            result = elgamal.decrypt(self.temp_private_key, same_cell_result)
 
-            # Extract their cell coordinates
-            other_cell_x = (other_cell_id - 1) // 1000
-            other_cell_y = (other_cell_id - 1) % 1000
-
-            # Get my cell coordinates
-            my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
-
-            # Check if we're in the same cell
-            is_nearby = (my_cell_x == other_cell_x and my_cell_y == other_cell_y)
+            # Simply check if result is 0 (same cell) or non-zero (different cells)
+            is_nearby = (result == 0)
 
             if is_nearby:
                 print("✓ Friend is nearby!")
-                return True
             else:
-                print(
-                    f"✗ Friend is not nearby!")
-                return False
+                print("✗ Friend is not nearby!")
+
+            return is_nearby
 
         except Exception as e:
             print(f"Error in proximity check: {e}")
