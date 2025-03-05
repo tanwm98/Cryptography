@@ -278,7 +278,7 @@ class Client:
     def receive_messages(self):
         while self.is_running:
             try:
-                data = self.socket.recv(1024).decode("utf-8")
+                data = self.socket.recv(4096).decode("utf-8")
                 if not data:
                     self.stop_flag.set()
                     print("Server connection closed")
@@ -288,8 +288,7 @@ class Client:
                 message = json.loads(data)
                 message_type = message.get("type", "")
 
-                # Print all server responses for debugging
-                print(f"\nServer response: {message}")
+                print(f"Received message: {message}")
 
                 if message_type == "registration_success":
                     print(message["message"])
@@ -413,15 +412,26 @@ class Client:
         # Create timestamp for freshness
         timestamp = int(time.time())
 
-        # Create request data
-        request_data = {
-            "public_key": serialize_public_key(public_key),
+        # Create request data with all information that should be signed
+        request_payload = {
+            "client_id": self.username,
+            "target_client_id": target_client_id,
+            "timestamp": timestamp,
             "encrypted_coordinates": {
                 "x": encrypt_to_json(encrypted_x),
                 "y": encrypt_to_json(encrypted_y)
             },
-            "timestamp": timestamp,
-            "resolution": self.grid_location.resolution  # Share grid resolution
+            "resolution": self.grid_location.resolution
+        }
+
+        # Sign the request payload using the existing method
+        signature = self.sign_message(request_payload)
+
+        # Add the signature to the request data
+        request_data = {
+            "public_key": serialize_public_key(public_key),
+            "request_payload": request_payload,
+            "signature": signature
         }
 
         # Create the request message
@@ -443,34 +453,55 @@ class Client:
                 return
 
             request_data = self.last_request_data
+            request_payload = request_data.get("request_payload", {})
+            signature = request_data.get("signature", "")
+
+            # Get the public key of the requestor
+            requestor_public_key = self.get_public_key(from_client_id)
+
+            # Verify the signature using the existing method
+            if not self.verify_signature(request_payload, signature, requestor_public_key):
+                print("Request signature verification failed - rejecting request")
+                return
 
             # Check timestamp freshness
             current_time = int(time.time())
-            if abs(current_time - request_data.get("timestamp", 0)) > 30:
+            if abs(current_time - request_payload.get("timestamp", 0)) > 30:
                 print("Request too old")
                 return
 
             # Initialize EC ElGamal
             elgamal = ECElGamal()
 
-            # Get requestor's public key
+            # Get requestor's public key for proximity encryption
             public_key = deserialize_public_key(request_data["public_key"])
 
             # Get my cell coordinates
             my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
 
-            # Compute proximity check result - send my cell information
-            # (simplified version of Pierre protocol)
+            # Compute proximity check result
             proximity_result = elgamal.compute_proximity_check(my_cell_x, my_cell_y, public_key)
 
-            # Create response with timestamp
+            # Create timestamp for response
             timestamp = int(time.time())
-            location_data = {
+
+            # Create response payload that will be signed
+            response_payload = {
+                "from_client_id": self.username,
+                "to_client_id": from_client_id,
+                "timestamp": timestamp,
                 "proximity_results": {
                     "same_cell": encrypt_to_json(proximity_result)
-                },
-                "timestamp": timestamp,
-                "from_client_id": self.username
+                }
+            }
+
+            # Sign the response using the existing method
+            signature = self.sign_message(response_payload)
+
+            # Create location data with signature
+            location_data = {
+                "response_payload": response_payload,
+                "signature": signature
             }
 
             # Send response
@@ -490,26 +521,43 @@ class Client:
 
     def proximity_check_cell(self, location_data):
         try:
-            proximity_results = location_data.get("proximity_results", {})
+            response_payload = location_data.get("response_payload", {})
+            signature = location_data.get("signature", "")
 
-            if not proximity_results:
-                print("Missing proximity results in response")
+            if not response_payload:
+                print("Missing response payload")
+                return False
+
+            from_client_id = response_payload.get("from_client_id")
+
+            # Get the public key of the responder
+            responder_public_key = self.get_public_key(from_client_id)
+
+            # Verify the signature using the existing method
+            if not self.verify_signature(response_payload, signature, responder_public_key):
+                print("Response signature verification failed - cannot trust this data")
                 return False
 
             # Check timestamp freshness
             current_time = int(time.time())
-            if abs(current_time - location_data["timestamp"]) > 30:
+            if abs(current_time - response_payload["timestamp"]) > 30:
                 print("Response too old")
                 return False
 
-            # Initialize EC ElGamal
+            # Initialize ElGamal
             elgamal = ECElGamal()
+
+            # Get proximity results
+            proximity_results = response_payload.get("proximity_results", {})
+            if not proximity_results or "same_cell" not in proximity_results:
+                print("Missing proximity results in response")
+                return False
 
             # Get my cell coordinates
             my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
             my_cell_id = my_cell_x * 100 + my_cell_y
 
-            # Decrypt Bob's result
+            # Decrypt the result
             same_cell_result = json_to_encrypt(proximity_results["same_cell"])
             their_cell_id = elgamal.decrypt(self.temp_private_key, same_cell_result)
 
@@ -699,7 +747,7 @@ class Client:
     def get_public_key(self, username):
         request = json.dumps({"type": "get_public_key", "target": username})
         self.send_message(request)
-        response = json.loads(self.socket.recv(1024).decode("utf-8"))
+        response = json.loads(self.socket.recv(4096).decode("utf-8"))
 
         if response["type"] != "public_key_response":
             raise Exception("Failed to get public key")
