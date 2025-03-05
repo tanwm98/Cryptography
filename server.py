@@ -9,6 +9,7 @@ from threading import RLock
 
 ph = PasswordHasher()
 
+SERVER = "127.0.0.1"
 PORT = 65432
 
 # ----- Data Classes -----
@@ -479,7 +480,7 @@ def session_cleanup_task(server_state, timeout=3600, interval=60):
 
 
 # ----- Server Startup -----
-def start_server(server_state, host="172.30.138.8", port=PORT):
+def start_server(server_state, host=SERVER, port=PORT):
     cleanup_thread = threading.Thread(target=session_cleanup_task, args=(server_state,), daemon=True)
     cleanup_thread.start()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

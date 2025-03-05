@@ -17,9 +17,8 @@ import time
 ph = PasswordHasher()
 
 # Client configuration
-HOST = "172.30.138.8"
+HOST = "127.0.0.1"
 PORT = 65432
-EUCLIDEAN_DISTANCE = 1414 # (1414 == same cell)
 
 
 class NetworkError(Exception):
@@ -36,10 +35,9 @@ class MessageQueue:
         with self.lock:
             if to_user not in self.messages:
                 self.messages[to_user] = []
-            self.messages[to_user].append({
-                'content': message,
-                'timestamp': time.time()
-            })
+            self.messages[to_user].append(
+                {"content": message, "timestamp": time.time()}
+            )
 
     def get_messages(self, user):
         with self.lock:
@@ -58,7 +56,7 @@ class Config:
     def load_config(self):
         with self.lock:
             try:
-                with open('config.json', 'r') as f:
+                with open("config.json", "r") as f:
                     self.settings = json.load(f)
             except FileNotFoundError:
                 self.settings = {}
@@ -69,11 +67,11 @@ class Config:
 
     def save_config(self):
         with self.lock:
-            temp_file = 'config.json.tmp'
+            temp_file = "config.json.tmp"
             try:
-                with open(temp_file, 'w') as f:
+                with open(temp_file, "w") as f:
                     json.dump(self.settings, f)
-                os.replace(temp_file, 'config.json')
+                os.replace(temp_file, "config.json")
             except Exception as e:
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
@@ -92,7 +90,7 @@ class SecureGridLocation:
         h = hmac.HMAC(key, hashes.SHA256())
         msg = f"{x},{y},{timestamp}".encode()
         h.update(msg)
-        return b64encode(h.finalize()).decode('utf-8')
+        return b64encode(h.finalize()).decode("utf-8")
 
     def verify_cell_proof(self, coord_x, coord_y, proof, timestamp, key):
         try:
@@ -104,7 +102,9 @@ class SecureGridLocation:
             current_time = int(time.time())
             max_age = 30  # 30 seconds
             if abs(current_time - timestamp) > max_age:
-                print(f"DEBUG - ✗ Timestamp too old: {current_time - timestamp} seconds")
+                print(
+                    f"DEBUG - ✗ Timestamp too old: {current_time - timestamp} seconds"
+                )
                 return False
 
             h = hmac.HMAC(key, hashes.SHA256())
@@ -163,7 +163,7 @@ class Client:
     def check_connection(self):
         try:
             # Send heartbeat (empty bytes)
-            self.socket.sendall(b'')
+            self.socket.sendall(b"")
             return True
         except Exception:
             return False
@@ -232,7 +232,7 @@ class Client:
             return False
 
     def register(self, username, password):
-        if not hasattr(self, 'socket') or not self.socket:
+        if not hasattr(self, "socket") or not self.socket:
             print("Not connected to server. Please connect first.")
             return False
 
@@ -247,16 +247,18 @@ class Client:
             # Serialize public key for transmission
             public_pem = identity_public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
             )
 
-            message = json.dumps({
-                "type": "register",
-                "username": username,
-                "password": password,
-                "identity_public_key": b64encode(public_pem).decode('utf-8'),
-                "key_created": int(time.time())
-            })
+            message = json.dumps(
+                {
+                    "type": "register",
+                    "username": username,
+                    "password": password,
+                    "identity_public_key": b64encode(public_pem).decode("utf-8"),
+                    "key_created": int(time.time()),
+                }
+            )
             self.socket.sendall(message.encode("utf-8"))
             return True
         except Exception as e:
@@ -264,7 +266,7 @@ class Client:
             return False
 
     def login(self, username, password):
-        if not hasattr(self, 'socket') or not self.socket:
+        if not hasattr(self, "socket") or not self.socket:
             print("Not connected to server. Please connect first.")
             return False
 
@@ -275,22 +277,24 @@ class Client:
 
             public_pem = public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
             )
             public_key = self.private_key.public_key()
 
             # Serialize public key
             public_pem = public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
             )
 
-            message = json.dumps({
-                "type": "login",
-                "username": username,
-                "password": password,
-                "public_key": b64encode(public_pem).decode('utf-8')
-            })
+            message = json.dumps(
+                {
+                    "type": "login",
+                    "username": username,
+                    "password": password,
+                    "public_key": b64encode(public_pem).decode("utf-8"),
+                }
+            )
             self.socket.sendall(message.encode("utf-8"))
             # Response will be handled by receive_messages thread
             return True
@@ -353,7 +357,9 @@ class Client:
                     self.friends = message.get("friends", [])
                     print("\nFriend list updated:", ", ".join(self.friends))
                 elif message_type == "received_message":
-                    print(f"\nMessage from {message['from_client_id']}: {message['content']}")
+                    print(
+                        f"\nMessage from {message['from_client_id']}: {message['content']}"
+                    )
                 elif message_type == "location_request":
                     from_client_id = message["from_client_id"]
                     self.send_location(from_client_id)
@@ -361,17 +367,11 @@ class Client:
                     location = message["location"]
 
                     start_time = time.time()  # Start timer
-                    is_nearby, is_same_cell = self.proximity_check_cell(location)
+                    is_same_cell = self.proximity_check_cell(location)
                     end_time = time.time()  # End timer
                     print(f"Proximity check took {end_time - start_time:.6f} seconds")
 
-
-
-                    if is_same_cell and is_nearby:
-                        print("Friend is nearby! (Same Cell and within EUCLIDEAN_DISTANCE range)")
-                    elif is_nearby:
-                        print("Friend is nearby! (within EUCLIDEAN_DISTANCE range)")
-                    elif is_same_cell:
+                    if is_same_cell:
                         print("Friend is nearby! (Same Cell)")
                     else:
                         print("Friend is not nearby!")
@@ -411,17 +411,21 @@ class Client:
             print("You must log in before requesting a location.")
             return
         if target_client_id == self.username:
-            print(f"Your current location is ({self.x}, {self.y}) in cell ({self.x // 1000}, {self.y // 1000})")
+            print(
+                f"Your current location is ({self.x}, {self.y}) in cell ({self.x // 1000}, {self.y // 1000})"
+            )
             return
         with self.friends_lock:
             if target_client_id not in self.friends:
                 print("You must be friends to view their location.")
                 return
-        request_message = json.dumps({
-            "type": "request_location",
-            "client_id": self.username,
-            "target_client_id": target_client_id,
-        })
+        request_message = json.dumps(
+            {
+                "type": "request_location",
+                "client_id": self.username,
+                "target_client_id": target_client_id,
+            }
+        )
         self.send_message(request_message)
         print(f"Requested location from client {target_client_id}")
 
@@ -438,21 +442,18 @@ class Client:
             except Exception as e:
                 print(f"Failed to get verified public key: {e}")
                 return
-            
+
             # Generate ephemeral key and derive shared key
             ephemeral_private = ec.generate_private_key(ec.SECP256K1())
-            
-            shared_key = ephemeral_private.exchange(
-                ec.ECDH(),
-                recipient_public_key
-            )
-            
+
+            shared_key = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
+
             # Derive key for both encryption and proof
             derived_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing',
+                info=b"location-sharing",
             ).derive(shared_key)
 
             # Generate location data with proof using derived key
@@ -460,18 +461,23 @@ class Client:
                 "coord_x": self.x,
                 "coord_y": self.y,
                 "timestamp": timestamp,
-                "proof": self.grid_location.generate_cell_proof(self.x, self.y, timestamp, derived_key)
+                "proof": self.grid_location.generate_cell_proof(
+                    self.x, self.y, timestamp, derived_key
+                ),
             }
 
             # Encrypt location data
-            encrypted_location = self.encrypt_for_recipient(to_client_id, location_data, ephemeral_private,
-                                                            recipient_public_key)
+            encrypted_location = self.encrypt_for_recipient(
+                to_client_id, location_data, ephemeral_private, recipient_public_key
+            )
 
-            response_message = json.dumps({
-                "type": "location_response",
-                "to_client_id": to_client_id,
-                "location": encrypted_location,
-            })
+            response_message = json.dumps(
+                {
+                    "type": "location_response",
+                    "to_client_id": to_client_id,
+                    "location": encrypted_location,
+                }
+            )
             self.send_message(response_message)
 
         except Exception as e:
@@ -480,37 +486,40 @@ class Client:
     def proximity_check_cell(self, encrypted_location):
         try:
             print("\nDEBUG - Starting proximity check with detailed logging")
-            print(f"DEBUG - My current location: cell ({self.x // 1000}, {self.y // 1000})")
+            print(
+                f"DEBUG - My current location: cell ({self.x // 1000}, {self.y // 1000})"
+            )
             print("DEBUG - Steps:")
 
             # Step 1: Load ephemeral key
             print("DEBUG - 1. Loading ephemeral public key...")
-            ephemeral_public_key_pem = b64decode(encrypted_location["ephemeral_public_key"])
-            ephemeral_public_key = serialization.load_pem_public_key(ephemeral_public_key_pem)
+            ephemeral_public_key_pem = b64decode(
+                encrypted_location["ephemeral_public_key"]
+            )
+            ephemeral_public_key = serialization.load_pem_public_key(
+                ephemeral_public_key_pem
+            )
             print("DEBUG - ✓ Ephemeral key loaded successfully")
-         
+
             # Step 2: Generate shared key
             print("DEBUG - 2. Generating shared key...")
-            shared_key = self.private_key.exchange(
-                ec.ECDH(),
-                ephemeral_public_key
-            )
+            shared_key = self.private_key.exchange(ec.ECDH(), ephemeral_public_key)
             print("DEBUG - ✓ Shared key generated")
-            
+
             # Step 3: Derive separate keys
             print("DEBUG - 3. Deriving separate keys using HKDF...")
             encryption_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing-encryption',
+                info=b"location-sharing-encryption",
             ).derive(shared_key)
-            
+
             proof_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing-proof',
+                info=b"location-sharing-proof",
             ).derive(shared_key)
             print("DEBUG - ✓ Keys derived successfully")
 
@@ -520,78 +529,67 @@ class Client:
                 nonce = b64decode(encrypted_location["nonce"])
                 ciphertext = b64decode(encrypted_location["encrypted"])
                 tag = b64decode(encrypted_location["tag"])
-                
-                cipher = Cipher(
-                    algorithms.AES(encryption_key),
-                    modes.GCM(nonce, tag)
-                )
+
+                cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce, tag))
                 decryptor = cipher.decryptor()
                 decrypted = decryptor.update(ciphertext) + decryptor.finalize()
                 location = json.loads(decrypted.decode())
                 print("DEBUG - ✓ GCM authentication and decryption successful")
             except Exception as e:
                 print(f"DEBUG - ✗ GCM authentication or decryption failed: {e}")
-                return False, False
+                return False
 
             # Step 5: Verify proof using proof_key
             print("DEBUG - 5. Verifying location proof...")
             try:
                 if not self.grid_location.verify_cell_proof(
-                        location["coord_x"],
-                        location["coord_y"],
-                        location["proof"],
-                        location["timestamp"],
-                        proof_key  # Use proof_key here
+                    location["coord_x"],
+                    location["coord_y"],
+                    location["proof"],
+                    location["timestamp"],
+                    proof_key,  # Use proof_key here
                 ):
                     print("DEBUG - ✗ Location proof verification failed")
                     return False, False
                 print("DEBUG - ✓ Location proof verified")
             except Exception as e:
                 print(f"DEBUG - ✗ Error during proof verification: {e}")
-                return False, False
+                return False
 
             # Step 6: Check proximity
             print("DEBUG - 6. Checking cell proximity...")
             is_same_cell = False
             my_cell = self.grid_location.coordinates_to_cell(self.x, self.y)
-            their_cell = self.grid_location.coordinates_to_cell(location["coord_x"], location["coord_y"])
+            their_cell = self.grid_location.coordinates_to_cell(
+                location["coord_x"], location["coord_y"]
+            )
             dx = abs(my_cell[0] - their_cell[0])
             dy = abs(my_cell[1] - their_cell[1])
 
             print(f"DEBUG - My cell: {my_cell}")
             print(f"DEBUG - Their cell: {their_cell}")
-            print(f"DEBUG - Cell distance: dx={dx}, dy={dy}")
-            
-            # Calculcate Euclidean Distance between locations
-            x1, y1 = self.x, self.y
-            x2, y2 = location["coord_x"], location["coord_y"]
-            distance = sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-            print(f"DEBUG - Euclidean distance: {distance}")
-            
-            if distance <= EUCLIDEAN_DISTANCE:
-                is_nearby = True
-            else:
-                is_nearby = False
 
             is_same_cell = dx == 0 and dy == 0
-            return is_nearby, is_same_cell
+            return is_same_cell
 
         except Exception as e:
             print("\nDEBUG - Unexpected error in proximity_check_cell:")
             print(f"DEBUG - Error type: {type(e).__name__}")
             print(f"DEBUG - Error message: {str(e)}")
             print(f"DEBUG - Error location: {e.__traceback__.tb_frame.f_code.co_name}")
-            return False, False
+            return False
 
     def add_friend(self, friend_username):
         if not self.is_logged_in:
             print("You must log in before adding a friend.")
             return
-        message = json.dumps({
-            "type": "add_friend",
-            "username": self.username,
-            "friend_username": friend_username,
-        })
+        message = json.dumps(
+            {
+                "type": "add_friend",
+                "username": self.username,
+                "friend_username": friend_username,
+            }
+        )
         self.send_message(message)
 
     def view_friend(self):
@@ -602,74 +600,69 @@ class Client:
         self.send_message(message)
 
     def msg_user(self, to_client_id, message_data):
-        response_message = json.dumps({
-            "type": "message_user",
-            "from_client_id": self.username,
-            "to_client_id": to_client_id,
-            "content": message_data,
-        })
+        response_message = json.dumps(
+            {
+                "type": "message_user",
+                "from_client_id": self.username,
+                "to_client_id": to_client_id,
+                "content": message_data,
+            }
+        )
         self.send_message(response_message)
         print(f"Sent message to client {to_client_id}")
 
     def check_messages(self):
-        message = json.dumps({
-            "type": "get_messages",
-            "username": self.username
-        })
+        message = json.dumps({"type": "get_messages", "username": self.username})
         self.send_message(message)
 
-    def encrypt_for_recipient(self, to_client_id, data, ephemeral_private, recipient_public_key):
+    def encrypt_for_recipient(
+        self, to_client_id, data, ephemeral_private, recipient_public_key
+    ):
         try:
             # Generate shared secret using ECDH
-            shared_key = ephemeral_private.exchange(
-                ec.ECDH(),
-                recipient_public_key
-            )
+            shared_key = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
 
             # Derive separate keys for encryption and proof
             encryption_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing-encryption',
+                info=b"location-sharing-encryption",
             ).derive(shared_key)
 
             proof_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing-proof',
+                info=b"location-sharing-proof",
             ).derive(shared_key)
 
             # Generate random nonce for GCM
             nonce = os.urandom(12)
 
             # Create GCM cipher
-            cipher = Cipher(
-                algorithms.AES(encryption_key),
-                modes.GCM(nonce)
-            )
+            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce))
             encryptor = cipher.encryptor()
 
             # Generate location proof using proof_key
-            data['proof'] = self.grid_location.generate_cell_proof(
-                self.x, self.y,
-                data['timestamp'],
-                proof_key  # Use proof_key here
+            data["proof"] = self.grid_location.generate_cell_proof(
+                self.x, self.y, data["timestamp"], proof_key  # Use proof_key here
             )
 
             # Convert data to bytes and encrypt
             data_bytes = json.dumps(data).encode()
             ciphertext = encryptor.update(data_bytes) + encryptor.finalize()
-            
+
             return {
-                "encrypted": b64encode(ciphertext).decode('utf-8'),
-                "nonce": b64encode(nonce).decode('utf-8'),
-                "tag": b64encode(encryptor.tag).decode('utf-8'),
-                "ephemeral_public_key": b64encode(ephemeral_private.public_key().public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                )).decode('utf-8')
+                "encrypted": b64encode(ciphertext).decode("utf-8"),
+                "nonce": b64encode(nonce).decode("utf-8"),
+                "tag": b64encode(encryptor.tag).decode("utf-8"),
+                "ephemeral_public_key": b64encode(
+                    ephemeral_private.public_key().public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                ).decode("utf-8"),
             }
         except Exception as e:
             print(f"DEBUG - Error in encrypt_for_recipient: {e}")
@@ -679,20 +672,19 @@ class Client:
         try:
             # Load ephemeral public key
             ephemeral_public_key_pem = b64decode(encrypted_data["ephemeral_public_key"])
-            ephemeral_public_key = serialization.load_pem_public_key(ephemeral_public_key_pem)
+            ephemeral_public_key = serialization.load_pem_public_key(
+                ephemeral_public_key_pem
+            )
 
             # Generate shared secret
-            shared_key = self.private_key.exchange(
-                ec.ECDH(),
-                ephemeral_public_key
-            )
+            shared_key = self.private_key.exchange(ec.ECDH(), ephemeral_public_key)
 
             # Derive encryption key
             encryption_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b'location-sharing-encryption',
+                info=b"location-sharing-encryption",
             ).derive(shared_key)
 
             # Decode components
@@ -701,10 +693,7 @@ class Client:
             tag = b64decode(encrypted_data["tag"])
 
             # Create GCM cipher
-            cipher = Cipher(
-                algorithms.AES(encryption_key),
-                modes.GCM(nonce, tag)
-            )
+            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce, tag))
             decryptor = cipher.decryptor()
 
             # Decrypt and verify in one step
@@ -722,11 +711,11 @@ class Client:
             json.dumps(message).encode(),
             asymmetric_padding.PSS(
                 mgf=asymmetric_padding.MGF1(hashes.SHA256()),
-                salt_length=asymmetric_padding.PSS.MAX_LENGTH
+                salt_length=asymmetric_padding.PSS.MAX_LENGTH,
             ),
-            hashes.SHA256()
+            hashes.SHA256(),
         )
-        return b64encode(signature).decode('utf-8')
+        return b64encode(signature).decode("utf-8")
 
     def verify_signature(self, message, signature, sender_public_key):
         try:
@@ -735,19 +724,16 @@ class Client:
                 json.dumps(message).encode(),
                 asymmetric_padding.PSS(
                     mgf=asymmetric_padding.MGF1(hashes.SHA256()),
-                    salt_length=asymmetric_padding.PSS.MAX_LENGTH
+                    salt_length=asymmetric_padding.PSS.MAX_LENGTH,
                 ),
-                hashes.SHA256()
+                hashes.SHA256(),
             )
             return True
         except Exception:
             return False
 
     def get_public_key(self, username):
-        request = json.dumps({
-            "type": "get_public_key",
-            "target": username
-        })
+        request = json.dumps({"type": "get_public_key", "target": username})
         self.send_message(request)
         response = json.loads(self.socket.recv(1024).decode("utf-8"))
 
@@ -763,26 +749,19 @@ class Client:
         return serialization.load_pem_public_key(public_key_pem)
 
     def send_friend_request(self, friend_username):
-        message = json.dumps({
-            "type": "friend_request",
-            "from": self.username,
-            "to": friend_username
-        })
+        message = json.dumps(
+            {"type": "friend_request", "from": self.username, "to": friend_username}
+        )
         self.send_message(message)
 
     def view_friend_requests(self):
-        message = json.dumps({
-            "type": "get_friend_requests",
-            "username": self.username
-        })
+        message = json.dumps({"type": "get_friend_requests", "username": self.username})
         self.send_message(message)
 
     def accept_friend_request(self, requestor):
-        message = json.dumps({
-            "type": "accept_friend_request",
-            "from": requestor,
-            "to": self.username
-        })
+        message = json.dumps(
+            {"type": "accept_friend_request", "from": requestor, "to": self.username}
+        )
         self.send_message(message)
 
     def close(self):
@@ -843,7 +822,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Error: {e}")
         else:
-            print("\n" + "="*50)  # Add separator line
+            print("\n" + "=" * 50)  # Add separator line
             print("Main Menu")
             print("4. Update Location")
             print("5. Check Cell")
@@ -854,7 +833,7 @@ if __name__ == "__main__":
             print("10. Send Message")
             print("11. Check Messages")
             print("12. Exit")
-            print("="*50 + "\n")  # Add separator line
+            print("=" * 50 + "\n")  # Add separator line
             try:
                 choice = input("Choose an option: ")
                 if choice == "4":
