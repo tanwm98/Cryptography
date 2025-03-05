@@ -1,6 +1,4 @@
-# elgamal.py
 import random
-import math
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization

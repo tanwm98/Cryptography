@@ -174,14 +174,13 @@ class Client:
             x = int(input("Enter your x coordinate (0-99999): "))
             y = int(input("Enter your y coordinate (0-99999): "))
             if 0 <= x <= 99999 and 0 <= y <= 99999:
-                print("\nDEBUG - Setting local location")
-                print(f"DEBUG - New coordinates: ({x}, {y})")
+                print(f"New coordinates: ({x}, {y})")
 
                 self.x = x
                 self.y = y
                 cell = self.grid_location.coordinates_to_cell(x, y)
-                print(f"DEBUG - New cell: ({cell[0]}, {cell[1]})")
-                print("DEBUG - Location updated locally")
+                print(f"New cell: ({cell[0]}, {cell[1]})")
+                print("Location updated locally")
                 return True
             else:
                 raise ValueError
@@ -288,8 +287,6 @@ class Client:
                 message = json.loads(data)
                 message_type = message.get("type", "")
 
-                print(f"Received message: {message}")
-
                 if message_type == "registration_success":
                     print(message["message"])
                 elif message_type == "registration_failed":
@@ -338,7 +335,6 @@ class Client:
                     # Only update if request_data is present
                     if "request_data" in message:
                         self.last_request_data = message.get("request_data", {})
-                        print(f"Stored location request data from {from_client_id}")
                         self.send_location(from_client_id)
                     else:
                         print(f"Received location request without data from {from_client_id}")
@@ -388,17 +384,14 @@ class Client:
         if not self.is_logged_in:
             print("You must log in before requesting a location.")
             return
-
-        if target_client_id not in self.friends:
+        if target_client_id == self.username:
+            print(f"Your location is ({self.x}, {self.y}) in cell {self.grid_location.coordinates_to_cell(self.x, self.y)}")
+        elif target_client_id not in self.friends:
             print(f"You must be friends with {target_client_id} to request their location.")
-            return
-        elif target_client_id == self.username:
-            print("You cannot request your own location.")
             return
 
         # Convert to grid coordinates
         my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
-        print(f"My cell coordinates: ({my_cell_x}, {my_cell_y})")
 
         # Generate EC ElGamal keypair for this request
         elgamal = ECElGamal()
@@ -512,7 +505,7 @@ class Client:
             })
 
             self.send_message(response_message)
-            print(f"Location response sent to {from_client_id} (Pierre protocol)")
+            print(f"Location response sent to {from_client_id}")
 
         except Exception as e:
             print(f"Error in send_location: {e}")
@@ -658,7 +651,7 @@ class Client:
                 ).decode("utf-8"),
             }
         except Exception as e:
-            print(f"DEBUG - Error in encrypt_for_recipient: {e}")
+            print(f"Error in encrypt_for_recipient: {e}")
             raise
 
     def decrypt_location(self, encrypted_data):
@@ -835,7 +828,7 @@ if __name__ == "__main__":
                 print(f"Error: {e}")
         else:
             print("\n" + "=" * 50)  # Add separator line
-            print("Main Menu")
+            print("Main Menu, logged in as:", client.username)
             print("4. Update Location")
             print("5. Check Cell")
             print("6. Send Friend Request")

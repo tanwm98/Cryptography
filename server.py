@@ -261,7 +261,6 @@ def handle_client(conn, addr, server_state: ServerState):
                         request_message = {"type": "location_request", "from_client_id": requesting_client_id, "request_data": request_data}
                         try:
                             target_session.connection.sendall(json.dumps(request_message).encode("utf-8"))
-                            print(f"Sent location request to client {target_client_id}")
                         except Exception as e:
                             print(f"Error notifying location request: {e}")
                             server_state.handle_connection_error(target_client_id)
@@ -278,7 +277,6 @@ def handle_client(conn, addr, server_state: ServerState):
                         }
                         try:
                             target_session.connection.sendall(json.dumps(response_message).encode("utf-8"))
-                            print(f"Sent location data to client {requesting_client_id}")
                         except Exception as e:
                             print(f"Error sending location data: {e}")
                             server_state.handle_connection_error(requesting_client_id)
@@ -391,7 +389,6 @@ def handle_client(conn, addr, server_state: ServerState):
                         try:
                             forward = {"type": "received_message", "from_client_id": from_client_id, "content": message_data}
                             target_session.connection.sendall(json.dumps(forward).encode("utf-8"))
-                            print(f"Sent message to client {to_client_id}")
                         except Exception as e:
                             print(f"Error forwarding message: {e}")
                             server_state.handle_connection_error(to_client_id)
@@ -495,7 +492,6 @@ def start_server(server_state, host=SERVER, port=PORT):
             except Exception as e:
                 print(f"Error accepting connection: {e}")
 
-# ----- Main Execution -----
 
 if __name__ == "__main__":
     server_state = ServerState()
