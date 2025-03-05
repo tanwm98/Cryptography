@@ -507,7 +507,7 @@ class Client:
 
             # Get my cell coordinates
             my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
-            my_cell_id = my_cell_x * 1000 + my_cell_y
+            my_cell_id = my_cell_x * 100 + my_cell_y
 
             # Decrypt Bob's result
             same_cell_result = json_to_encrypt(proximity_results["same_cell"])

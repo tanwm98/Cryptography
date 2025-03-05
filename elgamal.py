@@ -40,17 +40,8 @@ class ECElGamal:
             info=b'pierre-protocol-encryption',
         ).derive(shared_secret)
 
-        if random_factor is not None:
-            # For proximity check: if cells match (message is 0), result is 0
-            # Otherwise result is random non-zero value
-            if message == 0:
-                encrypted_value = 0  # Zero stays zero
-            else:
-                encrypted_value = random_factor
-        else:
-            # Standard encryption for other values
-            mask = int.from_bytes(encryption_key[:4], byteorder='big')
-            encrypted_value = message ^ mask
+        mask = int.from_bytes(encryption_key[:4], byteorder='big')
+        encrypted_value = message ^ mask
 
         ephemeral_public_bytes = ephemeral_public.public_bytes(
             encoding=serialization.Encoding.PEM,
@@ -93,7 +84,7 @@ class ECElGamal:
         without requiring their cell coordinates
         """
         # Create unique cell identifier by combining coordinates
-        cell_id = my_cell_x * 1000 + my_cell_y
+        cell_id = my_cell_x * 100 + my_cell_y
 
         # Generate random value ρ as specified in Pierre protocol
         rho = random.randint(1, 10000)
