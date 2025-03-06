@@ -410,6 +410,7 @@ def handle_client(conn, addr, server_state: ServerState):
                         if user_data and "public_key" in user_data:
                             response = {
                                 "type": "public_key_response",
+                                "target": target,
                                 "public_key": user_data["public_key"],
                                 "key_created": user_data["key_created"]
                             }

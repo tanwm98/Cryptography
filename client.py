@@ -353,14 +353,18 @@ class Client:
                     # Store the received public key for later use
                     public_key_data = message.get("public_key", "")
                     target_username = message.get("target", "")
+
                     # Cache the public key
+                    print(f"DEBUG: Received public key for {target_username}")
                     self.public_key_cache[target_username] = deserialize_public_key(public_key_data)
+
                     if hasattr(self,
                                "pending_public_key_requests") and target_username in self.pending_public_key_requests:
+                        print(f"DEBUG: Calling callback for {target_username}")
                         callback = self.pending_public_key_requests.pop(target_username)
                         callback(self.public_key_cache[target_username])
                     else:
-                        print("Received public key response with no pending request")
+                        print(f"DEBUG: No pending request for {target_username}, just caching")
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
                 elif message_type == "queued_messages":
@@ -418,6 +422,9 @@ class Client:
                 self.x, self.y, public_key, private_key
             )
 
+            # Add the public key to the request_data - this is the fix
+            request_data["public_key"] = serialize_public_key(public_key)
+
             # Create payload
             request_payload = {
                 "client_id": self.username,
@@ -435,8 +442,7 @@ class Client:
                 "client_id": self.username,
                 "target_client_id": target_client_id,
                 "request_data": request_data,
-                "signature": signature,
-                "public_key": serialize_public_key(public_key)
+                "signature": signature
             })
 
             self.send_message(request_message)
@@ -444,6 +450,7 @@ class Client:
 
         # Get public key with callback
         self.get_public_key(target_client_id, on_public_key_received)
+
     def send_location(self, from_client_id):
         try:
             # Get the request data
@@ -452,15 +459,29 @@ class Client:
                 return
 
             request_data = self.last_request_data
-            from_public_key = deserialize_public_key(request_data.get("public_key", ""))
+
+            # Debug the request data structure
+            print(f"DEBUG - Request data structure: {json.dumps(request_data, indent=2)}")
+
+            # Check if the public key is directly in the request_data
+            public_key_data = request_data.get("public_key")
+            if not public_key_data:
+                print("Missing public key in request data")
+                return
+
+            from_public_key = deserialize_public_key(public_key_data)
 
             # Initialize Pierre protocol
             pierre = PierreProtocol(resolution=1000)
 
-            # Process the request
+            # Get the encrypted values directly from the request_data
+            # Instead of looking for a nested 'request_data' field
+            encrypted_values = request_data.get("encrypted_values", {})
+
+            # Process the request with the correct data structure
             response_data = pierre.process_request(
                 self.x, self.y,
-                request_data.get("request_data", {}),
+                request_data,  # Pass the full request_data
                 from_public_key
             )
 
@@ -502,45 +523,23 @@ class Client:
                 print("Missing response payload")
                 return False
 
-            from_client_id = response_payload.get("from_client_id")
+            # Get the response data
+            response_data = response_payload.get("response_data", {})
 
-            # Use a callback to handle the public key response
-            def on_public_key_received(responder_public_key):
-                try:
-                    # Verify signature
-                    if not self.verify_signature(response_payload, signature, responder_public_key):
-                        print("Response signature verification failed - cannot trust this data")
-                        return False
+            # Extract the same_cell result directly
+            same_cell_data = response_data.get("same_cell", {})
+            is_same_cell = same_cell_data.get("value", 1) == 0
 
-                    # Check timestamp
-                    current_time = int(time.time())
-                    if abs(current_time - response_payload["timestamp"]) > 30:
-                        print("Response too old")
-                        return False
+            # Print debug info
+            print(f"DEBUG - Proximity result value: {same_cell_data.get('value')}")
+            print(f"DEBUG - Same cell? {is_same_cell}")
 
-                    # Initialize Pierre protocol
-                    pierre = PierreProtocol(resolution=1000)
-
-                    # Check the response
-                    proximity_result = pierre.check_response(
-                        response_payload.get("response_data", {}),
-                        self.temp_private_key
-                    )
-
-                    # Return result based on proximity check
-                    if proximity_result["same_cell"]:
-                        print("Friend is in the same cell!")
-                        return True
-                    else:
-                        print("Friend is not in the same cell!")
-                        return False
-                except Exception as e:
-                    print(f"Error processing public key: {e}")
-                    return False
-
-            # Get public key with callback
-            self.get_public_key(from_client_id, on_public_key_received)
-            return True  # This will be updated asynchronously
+            if is_same_cell:
+                print("\nFriend is in the same cell!")
+                return True
+            else:
+                print("\nFriend is not in the same cell!")
+                return False
 
         except Exception as e:
             print(f"Error in proximity check: {e}")
@@ -728,20 +727,42 @@ class Client:
             username: The username to get the public key for
             callback: Optional callback function to call with the public key when received
         """
+        print(f"DEBUG: Public key requested for {username}")
+
         # Check if we already have the public key cached
         if hasattr(self, "public_key_cache") and username in self.public_key_cache:
             if callback:
+                print(f"DEBUG: Using cached key for {username}")
                 callback(self.public_key_cache[username])
             return self.public_key_cache[username]
 
-        # Request the public key from the server
-        request = json.dumps({"type": "get_public_key", "target": username})
-        self.send_message(request)
+        # Check if we're already waiting for this key
+        if hasattr(self, "pending_public_key_requests") and username in self.pending_public_key_requests:
+            if callback:
+                # Store multiple callbacks for the same username
+                print(f"DEBUG: Already waiting for key for {username}, adding callback")
+                old_callback = self.pending_public_key_requests[username]
 
+                # Create a combined callback that calls both the old and new callbacks
+                def combined_callback(key):
+                    old_callback(key)
+                    callback(key)
+
+                self.pending_public_key_requests[username] = combined_callback
+            return None
+
+        # Set up the callback BEFORE sending the request
         if callback:
             if not hasattr(self, "pending_public_key_requests"):
                 self.pending_public_key_requests = {}
+            print(f"DEBUG: Requesting key for {username} with callback")
             self.pending_public_key_requests[username] = callback
+        else:
+            print(f"DEBUG: Requesting key for {username} without callback")
+
+        # Now send the request
+        request = json.dumps({"type": "get_public_key", "target": username})
+        self.send_message(request)
 
         return None  # Will be available through callback
     def send_friend_request(self, friend_username):

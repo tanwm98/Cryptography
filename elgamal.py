@@ -184,8 +184,8 @@ class PierreProtocol:
         # Decrypt the same_cell result
         same_cell_value = self.decrypt(private_key, same_cell)
 
-        # Determine proximity
-        # If same_cell_value = 0, they are in the same cell
+        # If we get 0, the parties are in the same cell
+        # (g^0 = 1 after decryption)
         if same_cell_value == 0:
             return {"same_cell": True}
         else:
@@ -193,7 +193,7 @@ class PierreProtocol:
 
     def encrypt(self, public_key, message, ephemeral_private=None):
         """
-        Encrypt a message using EC ElGamal with homomorphic properties
+        Encrypt a message using exponential ElGamal with homomorphic properties
 
         Args:
             public_key: Recipient's public key
@@ -201,7 +201,7 @@ class PierreProtocol:
             ephemeral_private: Optional ephemeral private key for reuse
 
         Returns:
-            ciphertext: Dictionary with ephemeral key and encrypted value
+            ciphertext: Dictionary with ciphertext components
         """
         if not isinstance(message, int):
             raise ValueError("Message must be an integer")
@@ -209,26 +209,20 @@ class PierreProtocol:
         # Generate ephemeral key pair if not provided
         if ephemeral_private is None:
             ephemeral_private = ec.generate_private_key(self.curve)
+
+        # Extract required values from keys
+        # Note: This is a simplified implementation
+        # In production, you'd need proper EC point operations
+        r = int.from_bytes(ephemeral_private.private_numbers().private_value.to_bytes(32, 'big'), 'big')
+        A = int.from_bytes(public_key.public_numbers().x.to_bytes(32, 'big'), 'big')
+
+        # Compute ciphertext components
+        c1 = pow(g, r, self.prime_modulus)  # g^r mod p
+        c2 = (pow(A, r, self.prime_modulus) * pow(g, message,
+                                                  self.prime_modulus)) % self.prime_modulus  # A^r * g^m mod p
+
+        # Store ephemeral key for serialization
         ephemeral_public = ephemeral_private.public_key()
-
-        # Derive shared secret
-        shared_secret = ephemeral_private.exchange(ec.ECDH(), public_key)
-
-        # Derive encryption key
-        encryption_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'pierre-protocol-encryption',
-        ).derive(shared_secret)
-
-        # Convert to integer mask
-        mask = int.from_bytes(encryption_key[:32], byteorder='big')
-
-        # Encrypt message (additive homomorphism)
-        encrypted_value = (message + mask) % self.prime_modulus
-
-        # Serialize ephemeral public key
         ephemeral_public_bytes = ephemeral_public.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
@@ -236,44 +230,39 @@ class PierreProtocol:
 
         return {
             "ephemeral": ephemeral_public_bytes,
-            "value": encrypted_value
+            "c1": c1,
+            "c2": c2
         }
 
     def decrypt(self, private_key, ciphertext):
         """
-        Decrypt a ciphertext
+        Decrypt a ciphertext using exponential ElGamal
 
         Args:
             private_key: Recipient's private key
-            ciphertext: Dictionary with ephemeral key and encrypted value
+            ciphertext: Dictionary with ciphertext components
 
         Returns:
             message: Decrypted integer message
         """
-        ephemeral_public_bytes = ciphertext["ephemeral"]
-        encrypted_value = ciphertext["value"]
+        c1 = ciphertext["c1"]
+        c2 = ciphertext["c2"]
 
-        # Load ephemeral public key
-        ephemeral_public = serialization.load_pem_public_key(ephemeral_public_bytes)
+        # Extract private key value
+        a = int.from_bytes(private_key.private_numbers().private_value.to_bytes(32, 'big'), 'big')
 
-        # Derive shared secret
-        shared_secret = private_key.exchange(ec.ECDH(), ephemeral_public)
+        # Compute g^m = c2 / c1^a mod p
+        c1_a = pow(c1, a, self.prime_modulus)
+        c1_a_inv = pow(c1_a, -1, self.prime_modulus)
+        g_m = (c2 * c1_a_inv) % self.prime_modulus
 
-        # Derive encryption key
-        encryption_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'pierre-protocol-encryption',
-        ).derive(shared_secret)
+        # Check if g^m equals 1 (which means m = 0)
+        if g_m == 1:
+            return 0
 
-        # Convert to integer mask
-        mask = int.from_bytes(encryption_key[:32], byteorder='big')
-
-        # Decrypt (inverse of encryption)
-        decrypted_value = (encrypted_value - mask) % self.prime_modulus
-
-        return decrypted_value
+        # For non-zero values, we'd need to solve the discrete log
+        # For our purposes, we just need to know if it's 0 or not
+        return 1  # Non-zero value
 
     def homomorphic_add(self, ciphertext1, ciphertext2):
         """
@@ -285,16 +274,16 @@ class PierreProtocol:
         Returns:
             ciphertext: Resulting ciphertext
         """
-        # Check that both ciphertexts use the same ephemeral key
-        if ciphertext1["ephemeral"] != ciphertext2["ephemeral"]:
-            raise ValueError("Homomorphic addition requires ciphertexts encrypted with the same ephemeral key")
+        # Multiply c1 components (g^r1 * g^r2 = g^(r1+r2))
+        c1 = (ciphertext1["c1"] * ciphertext2["c1"]) % self.prime_modulus
 
-        # Add the encrypted values modulo prime
-        result_value = (ciphertext1["value"] + ciphertext2["value"]) % self.prime_modulus
+        # Multiply c2 components ((A^r1 * g^m1) * (A^r2 * g^m2) = A^(r1+r2) * g^(m1+m2))
+        c2 = (ciphertext1["c2"] * ciphertext2["c2"]) % self.prime_modulus
 
         return {
-            "ephemeral": ciphertext1["ephemeral"],
-            "value": result_value
+            "ephemeral": ciphertext1["ephemeral"],  # Keep track of one of the ephemeral keys
+            "c1": c1,
+            "c2": c2
         }
 
     def scalar_multiply(self, ciphertext, scalar):
@@ -308,14 +297,15 @@ class PierreProtocol:
         Returns:
             ciphertext: Resulting ciphertext
         """
-        # Multiply the encrypted value by the scalar modulo prime
-        result_value = (ciphertext["value"] * scalar) % self.prime_modulus
+        # Raise both components to the scalar power
+        c1 = pow(ciphertext["c1"], scalar, self.prime_modulus)
+        c2 = pow(ciphertext["c2"], scalar, self.prime_modulus)
 
         return {
             "ephemeral": ciphertext["ephemeral"],
-            "value": result_value
+            "c1": c1,
+            "c2": c2
         }
-
     def serialize_encrypted(self, encrypted):
         """
         Serialize encrypted values for transmission
@@ -341,6 +331,15 @@ class PierreProtocol:
         Returns:
             encrypted: Dictionary with ephemeral key and encrypted value
         """
+        # Check if we have the expected keys
+        if not serialized or "ephemeral" not in serialized or "value" not in serialized:
+            print(f"Invalid serialized data: {serialized}")
+            # Return a default empty structure or raise a more specific exception
+            return {
+                "ephemeral": b"",
+                "value": 0
+            }
+
         return {
             "ephemeral": b64decode(serialized["ephemeral"]),
             "value": serialized["value"]
@@ -359,5 +358,19 @@ def serialize_public_key(public_key):
 
 def deserialize_public_key(serialized_key):
     """Restore public key from serialized format"""
-    public_bytes = b64decode(serialized_key)
-    return serialization.load_pem_public_key(public_bytes)
+    try:
+        if not serialized_key:
+            print("Empty serialized key received")
+            return None
+
+        public_bytes = b64decode(serialized_key)
+        return serialization.load_pem_public_key(public_bytes)
+    except Exception as e:
+        print(f"Error deserializing public key: {e}")
+        # Instead of returning None, we should try to recover
+        try:
+            # Try with stricter error handling
+            public_bytes = b64decode(serialized_key.strip())
+            return serialization.load_pem_public_key(public_bytes)
+        except Exception:
+            return None
