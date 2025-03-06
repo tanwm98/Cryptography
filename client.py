@@ -2,15 +2,14 @@ import socket
 import json
 import threading
 import os
-from cryptography.exceptions import InvalidKey
-from cryptography.hazmat.primitives import serialization, hashes, hmac
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding, ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64encode, b64decode
 from argon2 import PasswordHasher
 import time
-from elgamal import ECElGamal, serialize_public_key, deserialize_public_key, encrypt_to_json, json_to_encrypt, pierre_proximity_check
+from elgamal import PierreProtocol, serialize_public_key, deserialize_public_key
 import random
 
 ph = PasswordHasher()
@@ -121,6 +120,7 @@ class Client:
         self.stop_flag = threading.Event()  # Flag to signal the thread to stop
         # Use an instance of MessageQueue for queued messages
         self.message_queue = MessageQueue()
+        self.public_key_cache = {}
 
     # --- Connection Management Methods ---
     def send_message(self, message):
@@ -349,6 +349,18 @@ class Client:
                         print("Friend is nearby!")
                     else:
                         print("Friend is not nearby!")
+                elif message_type == "public_key_response":
+                    # Store the received public key for later use
+                    public_key_data = message.get("public_key", "")
+                    target_username = message.get("target", "")
+                    # Cache the public key
+                    self.public_key_cache[target_username] = deserialize_public_key(public_key_data)
+                    if hasattr(self,
+                               "pending_public_key_requests") and target_username in self.pending_public_key_requests:
+                        callback = self.pending_public_key_requests.pop(target_username)
+                        callback(self.public_key_cache[target_username])
+                    else:
+                        print("Received public key response with no pending request")
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
                 elif message_type == "queued_messages":
@@ -385,123 +397,92 @@ class Client:
             print("You must log in before requesting a location.")
             return
         if target_client_id == self.username:
-            print(f"Your location is ({self.x}, {self.y}) in cell {self.grid_location.coordinates_to_cell(self.x, self.y)}")
+            print(
+                f"Your location is ({self.x}, {self.y}) in cell {self.grid_location.coordinates_to_cell(self.x, self.y)}")
+            return
         elif target_client_id not in self.friends:
             print(f"You must be friends with {target_client_id} to request their location.")
             return
 
-        # Convert to grid coordinates
-        my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
+        # Get target user's public key using callback
+        def on_public_key_received(target_public_key):
+            # Initialize Pierre protocol
+            pierre = PierreProtocol(resolution=1000)
 
-        # Generate EC ElGamal keypair for this request
-        elgamal = ECElGamal()
-        public_key, private_key = elgamal.generate_keys()
-        self.temp_private_key = private_key  # Store for decryption
+            # Generate key pair for this request
+            public_key, private_key = pierre.generate_keypair()
+            self.temp_private_key = private_key  # Store for later use
 
-        # Encrypt my cell coordinates
-        encrypted_x = elgamal.encrypt(public_key, my_cell_x)
-        encrypted_y = elgamal.encrypt(public_key, my_cell_y)
+            # Prepare request
+            request_data, _ = pierre.prepare_request(
+                self.x, self.y, public_key, private_key
+            )
 
-        # Create timestamp for freshness
-        timestamp = int(time.time())
+            # Create payload
+            request_payload = {
+                "client_id": self.username,
+                "target_client_id": target_client_id,
+                "timestamp": int(time.time()),
+                "request_data": request_data
+            }
 
-        # Create request data with all information that should be signed
-        request_payload = {
-            "client_id": self.username,
-            "target_client_id": target_client_id,
-            "timestamp": timestamp,
-            "encrypted_coordinates": {
-                "x": encrypt_to_json(encrypted_x),
-                "y": encrypt_to_json(encrypted_y)
-            },
-            "resolution": self.grid_location.resolution
-        }
+            # Sign the request payload
+            signature = self.sign_message(request_payload)
 
-        # Sign the request payload using the existing method
-        signature = self.sign_message(request_payload)
+            # Create request message
+            request_message = json.dumps({
+                "type": "request_location",
+                "client_id": self.username,
+                "target_client_id": target_client_id,
+                "request_data": request_data,
+                "signature": signature,
+                "public_key": serialize_public_key(public_key)
+            })
 
-        # Add the signature to the request data
-        request_data = {
-            "public_key": serialize_public_key(public_key),
-            "request_payload": request_payload,
-            "signature": signature
-        }
+            self.send_message(request_message)
+            print(f"Location request sent to {target_client_id}")
 
-        # Create the request message
-        request_message = json.dumps({
-            "type": "request_location",
-            "client_id": self.username,
-            "target_client_id": target_client_id,
-            "request_data": request_data
-        })
-
-        self.send_message(request_message)
-        print(f"Location request sent to {target_client_id}")
-
+        # Get public key with callback
+        self.get_public_key(target_client_id, on_public_key_received)
     def send_location(self, from_client_id):
         try:
-            # Get the request data from the received message
+            # Get the request data
             if not hasattr(self, "last_request_data") or not self.last_request_data:
                 print("No location request data available")
                 return
 
             request_data = self.last_request_data
-            request_payload = request_data.get("request_payload", {})
-            signature = request_data.get("signature", "")
+            from_public_key = deserialize_public_key(request_data.get("public_key", ""))
 
-            # Get the public key of the requestor
-            requestor_public_key = self.get_public_key(from_client_id)
+            # Initialize Pierre protocol
+            pierre = PierreProtocol(resolution=1000)
 
-            # Verify the signature using the existing method
-            if not self.verify_signature(request_payload, signature, requestor_public_key):
-                print("Request signature verification failed - rejecting request")
-                return
+            # Process the request
+            response_data = pierre.process_request(
+                self.x, self.y,
+                request_data.get("request_data", {}),
+                from_public_key
+            )
 
-            # Check timestamp freshness
-            current_time = int(time.time())
-            if abs(current_time - request_payload.get("timestamp", 0)) > 30:
-                print("Request too old")
-                return
-
-            # Initialize EC ElGamal
-            elgamal = ECElGamal()
-
-            # Get requestor's public key for proximity encryption
-            public_key = deserialize_public_key(request_data["public_key"])
-
-            # Get my cell coordinates
-            my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
-
-            # Compute proximity check result
-            proximity_result = elgamal.compute_proximity_check(my_cell_x, my_cell_y, public_key)
-
-            # Create timestamp for response
-            timestamp = int(time.time())
-
-            # Create response payload that will be signed
+            # Create response payload
             response_payload = {
                 "from_client_id": self.username,
                 "to_client_id": from_client_id,
-                "timestamp": timestamp,
-                "proximity_results": {
-                    "same_cell": encrypt_to_json(proximity_result)
-                }
+                "timestamp": int(time.time()),
+                "response_data": response_data
             }
 
-            # Sign the response using the existing method
+            # Sign the response
             signature = self.sign_message(response_payload)
 
-            # Create location data with signature
-            location_data = {
-                "response_payload": response_payload,
-                "signature": signature
-            }
-
-            # Send response
+            # Create response message
             response_message = json.dumps({
                 "type": "location_response",
                 "to_client_id": from_client_id,
-                "location": location_data
+                "location": {
+                    "response_payload": response_payload,
+                    "signature": signature
+                }
             })
 
             self.send_message(response_message)
@@ -523,41 +504,43 @@ class Client:
 
             from_client_id = response_payload.get("from_client_id")
 
-            # Get the public key of the responder
-            responder_public_key = self.get_public_key(from_client_id)
+            # Use a callback to handle the public key response
+            def on_public_key_received(responder_public_key):
+                try:
+                    # Verify signature
+                    if not self.verify_signature(response_payload, signature, responder_public_key):
+                        print("Response signature verification failed - cannot trust this data")
+                        return False
 
-            # Verify the signature using the existing method
-            if not self.verify_signature(response_payload, signature, responder_public_key):
-                print("Response signature verification failed - cannot trust this data")
-                return False
+                    # Check timestamp
+                    current_time = int(time.time())
+                    if abs(current_time - response_payload["timestamp"]) > 30:
+                        print("Response too old")
+                        return False
 
-            # Check timestamp freshness
-            current_time = int(time.time())
-            if abs(current_time - response_payload["timestamp"]) > 30:
-                print("Response too old")
-                return False
+                    # Initialize Pierre protocol
+                    pierre = PierreProtocol(resolution=1000)
 
-            # Initialize ElGamal
-            elgamal = ECElGamal()
+                    # Check the response
+                    proximity_result = pierre.check_response(
+                        response_payload.get("response_data", {}),
+                        self.temp_private_key
+                    )
 
-            # Get proximity results
-            proximity_results = response_payload.get("proximity_results", {})
-            if not proximity_results or "same_cell" not in proximity_results:
-                print("Missing proximity results in response")
-                return False
+                    # Return result based on proximity check
+                    if proximity_result["same_cell"]:
+                        print("Friend is in the same cell!")
+                        return True
+                    else:
+                        print("Friend is not in the same cell!")
+                        return False
+                except Exception as e:
+                    print(f"Error processing public key: {e}")
+                    return False
 
-            # Get my cell coordinates
-            my_cell_x, my_cell_y = self.grid_location.coordinates_to_cell(self.x, self.y)
-            my_cell_id = my_cell_x * 100 + my_cell_y
-
-            # Decrypt the result
-            same_cell_result = json_to_encrypt(proximity_results["same_cell"])
-            their_cell_id = elgamal.decrypt(self.temp_private_key, same_cell_result)
-
-            # Compare cell IDs
-            is_nearby = (my_cell_id == their_cell_id)
-
-            return is_nearby
+            # Get public key with callback
+            self.get_public_key(from_client_id, on_public_key_received)
+            return True  # This will be updated asynchronously
 
         except Exception as e:
             print(f"Error in proximity check: {e}")
@@ -737,22 +720,30 @@ class Client:
         except Exception:
             return False
 
-    def get_public_key(self, username):
+    def get_public_key(self, username, callback=None):
+        """
+        Get the public key of another user
+
+        Args:
+            username: The username to get the public key for
+            callback: Optional callback function to call with the public key when received
+        """
+        # Check if we already have the public key cached
+        if hasattr(self, "public_key_cache") and username in self.public_key_cache:
+            if callback:
+                callback(self.public_key_cache[username])
+            return self.public_key_cache[username]
+
+        # Request the public key from the server
         request = json.dumps({"type": "get_public_key", "target": username})
         self.send_message(request)
-        response = json.loads(self.socket.recv(4096).decode("utf-8"))
 
-        if response["type"] != "public_key_response":
-            raise Exception("Failed to get public key")
+        if callback:
+            if not hasattr(self, "pending_public_key_requests"):
+                self.pending_public_key_requests = {}
+            self.pending_public_key_requests[username] = callback
 
-        # Verify key timestamp
-        key_created = response["key_created"]
-        if not isinstance(key_created, int):
-            raise Exception("Invalid key timestamp")
-
-        public_key_pem = b64decode(response["public_key"])
-        return serialization.load_pem_public_key(public_key_pem)
-
+        return None  # Will be available through callback
     def send_friend_request(self, friend_username):
         message = json.dumps(
             {"type": "friend_request", "from": self.username, "to": friend_username}
