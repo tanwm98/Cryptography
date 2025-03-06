@@ -120,7 +120,6 @@ class Client:
         self.stop_flag = threading.Event()  # Flag to signal the thread to stop
         # Use an instance of MessageQueue for queued messages
         self.message_queue = MessageQueue()
-        self.public_key_cache = {}
 
     # --- Connection Management Methods ---
     def send_message(self, message):
@@ -408,48 +407,31 @@ class Client:
             print(f"You must be friends with {target_client_id} to request their location.")
             return
 
-        # Get target user's public key using callback
-        def on_public_key_received(target_public_key):
-            # Initialize Pierre protocol
-            pierre = PierreProtocol(resolution=1000)
+        # Initialize Pierre protocol
+        pierre = PierreProtocol(resolution=1000)
 
-            # Generate key pair for this request
-            public_key, private_key = pierre.generate_keypair()
-            self.temp_private_key = private_key  # Store for later use
+        # Generate key pair for this request
+        public_key, private_key = pierre.generate_keypair()
+        self.temp_private_key = private_key  # Store for later use
 
-            # Prepare request
-            request_data, _ = pierre.prepare_request(
-                self.x, self.y, public_key, private_key
-            )
+        # Prepare request
+        request_data, _ = pierre.prepare_request(
+            self.x, self.y, public_key, private_key
+        )
 
-            # Add the public key to the request_data - this is the fix
-            request_data["public_key"] = serialize_public_key(public_key)
+        # Add the public key to the request_data
+        request_data["public_key"] = serialize_public_key(public_key)
 
-            # Create payload
-            request_payload = {
-                "client_id": self.username,
-                "target_client_id": target_client_id,
-                "timestamp": int(time.time()),
-                "request_data": request_data
-            }
+        # Create request message
+        request_message = json.dumps({
+            "type": "request_location",
+            "client_id": self.username,
+            "target_client_id": target_client_id,
+            "request_data": request_data
+        })
 
-            # Sign the request payload
-            signature = self.sign_message(request_payload)
-
-            # Create request message
-            request_message = json.dumps({
-                "type": "request_location",
-                "client_id": self.username,
-                "target_client_id": target_client_id,
-                "request_data": request_data,
-                "signature": signature
-            })
-
-            self.send_message(request_message)
-            print(f"Location request sent to {target_client_id}")
-
-        # Get public key with callback
-        self.get_public_key(target_client_id, on_public_key_received)
+        self.send_message(request_message)
+        print(f"Location request sent to {target_client_id}")
 
     def send_location(self, from_client_id):
         try:
@@ -460,49 +442,38 @@ class Client:
 
             request_data = self.last_request_data
 
-            # Debug the request data structure
-            print(f"DEBUG - Request data structure: {json.dumps(request_data, indent=2)}")
-
-            # Check if the public key is directly in the request_data
+            # Get requester's public key from request data
             public_key_data = request_data.get("public_key")
             if not public_key_data:
                 print("Missing public key in request data")
                 return
 
             from_public_key = deserialize_public_key(public_key_data)
+            if not from_public_key:
+                print("Failed to deserialize public key")
+                return
 
             # Initialize Pierre protocol
             pierre = PierreProtocol(resolution=1000)
 
-            # Get the encrypted values directly from the request_data
-            # Instead of looking for a nested 'request_data' field
-            encrypted_values = request_data.get("encrypted_values", {})
-
-            # Process the request with the correct data structure
+            # Process the request
             response_data = pierre.process_request(
                 self.x, self.y,
                 request_data,  # Pass the full request_data
                 from_public_key
             )
 
-            # Create response payload
-            response_payload = {
-                "from_client_id": self.username,
-                "to_client_id": from_client_id,
-                "timestamp": int(time.time()),
-                "response_data": response_data
-            }
-
-            # Sign the response
-            signature = self.sign_message(response_payload)
-
             # Create response message
             response_message = json.dumps({
                 "type": "location_response",
                 "to_client_id": from_client_id,
                 "location": {
-                    "response_payload": response_payload,
-                    "signature": signature
+                    "response_payload": {
+                        "from_client_id": self.username,
+                        "to_client_id": from_client_id,
+                        "timestamp": int(time.time()),
+                        "response_data": response_data
+                    }
                 }
             })
 
@@ -514,31 +485,37 @@ class Client:
             import traceback
             traceback.print_exc()
 
+    # In the proximity_check_cell method, update to handle all three responses:
     def proximity_check_cell(self, location_data):
         try:
             response_payload = location_data.get("response_payload", {})
-            signature = location_data.get("signature", "")
-
-            if not response_payload:
-                print("Missing response payload")
-                return False
 
             # Get the response data
             response_data = response_payload.get("response_data", {})
 
-            # Extract the same_cell result directly
+            # Initialize Pierre protocol
+            pierre = PierreProtocol(resolution=1000)
+
+            # Check all three proximity levels
             same_cell_data = response_data.get("same_cell", {})
-            is_same_cell = same_cell_data.get("value", 1) == 0
 
-            # Print debug info
-            print(f"DEBUG - Proximity result value: {same_cell_data.get('value')}")
-            print(f"DEBUG - Same cell? {is_same_cell}")
+            # Deserialize the ciphertexts
+            same_cell = pierre.deserialize_ciphertext(same_cell_data)
 
-            if is_same_cell:
+            # Decrypt using the temporary private key
+            start_time = time.time()  # Start timer
+
+            same_cell_result = pierre.decrypt(self.temp_private_key, same_cell)
+
+            end_time = time.time()  # End timer
+            print(f"Proximity check took {end_time - start_time:.6f} seconds")
+
+            # Check the results
+            if same_cell_result == 0:
                 print("\nFriend is in the same cell!")
                 return True
             else:
-                print("\nFriend is not in the same cell!")
+                print("\nFriend is not nearby!")
                 return False
 
         except Exception as e:
