@@ -41,22 +41,19 @@ class ServerState:
         self.friends = {}          # username -> list of friends
         self.clients = {}          # username -> ClientSession
         self.pending_requests = {} # username -> list of PendingRequest
-        self.message_queues = {}   # username -> list of messages
 
         # Use RLock to allow nested acquisitions
         self.users_lock = RLock()
         self.friends_lock = RLock()
         self.clients_lock = RLock()
         self.pending_requests_lock = RLock()
-        self.message_queues_lock = RLock()
 
         # Documented lock order: users_lock -> friends_lock -> clients_lock -> pending_requests_lock -> message_queues_lock
         self.lock_order = {
             'users_lock': 1,
             'friends_lock': 2,
             'clients_lock': 3,
-            'pending_requests_lock': 4,
-            'message_queues_lock': 5
+            'pending_requests_lock': 4
         }
 
         self.load_all_data()
@@ -133,18 +130,6 @@ class ServerState:
                 del self.clients[username]
                 print(f"Handled connection error for {username}")
 
-    def handle_get_public_key(self, message):
-        target = message["target"]
-        with self.users_lock:
-            user_data = self.users.get(target)
-            if user_data and "public_key" in user_data:
-                return {
-                    "type": "public_key_response",
-                    "public_key": user_data["public_key"],
-                    "key_created": user_data["key_created"]
-                }
-            return {"type": "error", "message": "Public key not found"}
-
     # Pending requests
     def add_pending_request(self, to_user, request):
         with self.pending_requests_lock:
@@ -159,18 +144,6 @@ class ServerState:
                     r for r in self.pending_requests[to_user] if r.from_user != from_user
                 ]
 
-    # Message queue operations
-    def add_message(self, username, message):
-        with self.message_queues_lock:
-            if username not in self.message_queues:
-                self.message_queues[username] = []
-            self.message_queues[username].append(message)
-
-    def get_messages(self, username):
-        with self.message_queues_lock:
-            messages = self.message_queues.get(username, [])
-            self.message_queues[username] = []
-            return messages
 
 # ----- Client Handler -----
 
@@ -214,7 +187,7 @@ def handle_client(conn, addr, server_state: ServerState):
                 elif message_type == "login":
                     username = message["username"]
                     password = message["password"]
-                    session_public_key  = message.get("session_public_key")
+                    session_public_key = message.get("session_public_key")
                     with server_state.users_lock:
                         user_data = server_state.users.get(username)
                         if user_data and "password" in user_data:
@@ -379,44 +352,6 @@ def handle_client(conn, addr, server_state: ServerState):
                         except Exception as e:
                             print(f"Error updating friend list: {e}")
                             server_state.handle_connection_error(to_user)
-
-                elif message_type == "message_user":
-                    from_client_id = message["from_client_id"]
-                    to_client_id = message["to_client_id"]
-                    message_data = message["content"]
-                    target_session = server_state.get_client(to_client_id)
-                    if target_session:
-                        try:
-                            forward = {"type": "received_message", "from_client_id": from_client_id, "content": message_data}
-                            target_session.connection.sendall(json.dumps(forward).encode("utf-8"))
-                        except Exception as e:
-                            print(f"Error forwarding message: {e}")
-                            server_state.handle_connection_error(to_client_id)
-                    else:
-                        server_state.add_message(to_client_id, {"from": from_client_id, "content": message_data, "timestamp": time.time()})
-                        response = {"type": "message_stored", "message": "Message stored for offline delivery."}
-                        conn.sendall(json.dumps(response).encode("utf-8"))
-
-                elif message_type == "get_messages":
-                    username = message["username"]
-                    messages = server_state.get_messages(username)
-                    response = {"type": "queued_messages", "messages": messages}
-                    conn.sendall(json.dumps(response).encode("utf-8"))
-                    conn.sendall(json.dumps(response).encode("utf-8"))
-                elif message_type == "get_public_key":
-                    target = message["target"]
-                    with server_state.users_lock:
-                        user_data = server_state.users.get(target)
-                        if user_data and "public_key" in user_data:
-                            response = {
-                                "type": "public_key_response",
-                                "target": target,
-                                "public_key": user_data["public_key"],
-                                "key_created": user_data["key_created"]
-                            }
-                        else:
-                            response = {"type": "error", "message": "Public key not found"}
-                    conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "get_friend_requests":
                     username = message["username"]
                     with server_state.pending_requests_lock:

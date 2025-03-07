@@ -22,28 +22,6 @@ PORT = 65432
 class NetworkError(Exception):
     pass
 
-
-# --- Updated MessageQueue with Locking ---
-class MessageQueue:
-    def __init__(self):
-        self.messages = {}
-        self.lock = threading.RLock()
-
-    def add_message(self, to_user, message):
-        with self.lock:
-            if to_user not in self.messages:
-                self.messages[to_user] = []
-            self.messages[to_user].append(
-                {"content": message, "timestamp": time.time()}
-            )
-
-    def get_messages(self, user):
-        with self.lock:
-            messages = self.messages.get(user, [])
-            self.messages[user] = []  # Clear after reading
-            return messages
-
-
 # --- Updated Config with Atomic File Operations ---
 class Config:
     def __init__(self):
@@ -78,12 +56,6 @@ class Config:
 
 class SecureGridLocation:
     def __init__(self, resolution=1000):
-        """
-        Initialize with a resolution
-
-        Args:
-            resolution: Grid cell size (default 1000)
-        """
         self.resolution = resolution
         self.key = None
 
@@ -91,7 +63,7 @@ class SecureGridLocation:
         """Convert exact coordinates to grid cell coordinates"""
         cell_x = x // self.resolution
         cell_y = y // self.resolution
-        return (cell_x, cell_y)
+        return cell_x, cell_y
 
     def set_key(self, key):
         """Set encryption key"""
@@ -115,11 +87,8 @@ class Client:
         self.grid_location = None
         # Thread safety locks
         self.friends_lock = threading.RLock()
-        self.message_queue_lock = threading.RLock()
         self.connection_lock = threading.RLock()
         self.stop_flag = threading.Event()  # Flag to signal the thread to stop
-        # Use an instance of MessageQueue for queued messages
-        self.message_queue = MessageQueue()
 
     # --- Connection Management Methods ---
     def send_message(self, message):
@@ -276,7 +245,7 @@ class Client:
     def receive_messages(self):
         while self.is_running:
             try:
-                data = self.socket.recv(4096).decode("utf-8")
+                data = self.socket.recv(8192).decode("utf-8")
                 if not data:
                     self.stop_flag.set()
                     print("Server connection closed")
@@ -321,13 +290,6 @@ class Client:
                         print("\nYour friends:", ", ".join(self.friends))
                     else:
                         print("\nYou have no friends yet.")
-                elif message_type == "friend_request_accepted":
-                    self.friends = message.get("friends", [])
-                    print("\nFriend list updated:", ", ".join(self.friends))
-                elif message_type == "received_message":
-                    print(
-                        f"\nMessage from {message['from_client_id']}: {message['content']}"
-                    )
                 elif message_type == "location_request":
                     from_client_id = message["from_client_id"]
                     # Store the last request for use in send_location
@@ -348,32 +310,8 @@ class Client:
                         print("Friend is nearby!")
                     else:
                         print("Friend is not nearby!")
-                elif message_type == "public_key_response":
-                    # Store the received public key for later use
-                    public_key_data = message.get("public_key", "")
-                    target_username = message.get("target", "")
-
-                    # Cache the public key
-                    print(f"DEBUG: Received public key for {target_username}")
-                    self.public_key_cache[target_username] = deserialize_public_key(public_key_data)
-
-                    if hasattr(self,
-                               "pending_public_key_requests") and target_username in self.pending_public_key_requests:
-                        print(f"DEBUG: Calling callback for {target_username}")
-                        callback = self.pending_public_key_requests.pop(target_username)
-                        callback(self.public_key_cache[target_username])
-                    else:
-                        print(f"DEBUG: No pending request for {target_username}, just caching")
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
-                elif message_type == "queued_messages":
-                    messages = message.get("messages", [])
-                    if messages:
-                        print("\nQueued messages:")
-                        for msg in messages:
-                            print(f"From {msg['from']}: {msg['content']}")
-                    else:
-                        print("No queued messages")
                 elif message_type == "location_update_success":
                     print("Location updated successfully")
                 elif message_type == "success":
@@ -544,111 +482,6 @@ class Client:
         message = json.dumps({"type": "view_friends", "username": self.username})
         self.send_message(message)
 
-    def msg_user(self, to_client_id, message_data):
-        response_message = json.dumps(
-            {
-                "type": "message_user",
-                "from_client_id": self.username,
-                "to_client_id": to_client_id,
-                "content": message_data,
-            }
-        )
-        self.send_message(response_message)
-        print(f"Sent message to client {to_client_id}")
-
-    def check_messages(self):
-        message = json.dumps({"type": "get_messages", "username": self.username})
-        self.send_message(message)
-
-    def encrypt_for_recipient(
-        self, to_client_id, data, ephemeral_private, recipient_public_key
-    ):
-        try:
-            # Generate shared secret using ECDH
-            shared_key = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
-
-            # Derive separate keys for encryption and proof
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            proof_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-proof",
-            ).derive(shared_key)
-
-            # Generate random nonce for GCM
-            nonce = os.urandom(12)
-
-            # Create GCM cipher
-            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce))
-            encryptor = cipher.encryptor()
-
-            # Generate location proof using proof_key
-            data["proof"] = self.grid_location.generate_cell_proof(
-                self.x, self.y, data["timestamp"], proof_key  # Use proof_key here
-            )
-
-            # Convert data to bytes and encrypt
-            data_bytes = json.dumps(data).encode()
-            ciphertext = encryptor.update(data_bytes) + encryptor.finalize()
-
-            return {
-                "encrypted": b64encode(ciphertext).decode("utf-8"),
-                "nonce": b64encode(nonce).decode("utf-8"),
-                "tag": b64encode(encryptor.tag).decode("utf-8"),
-                "ephemeral_public_key": b64encode(
-                    ephemeral_private.public_key().public_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                    )
-                ).decode("utf-8"),
-            }
-        except Exception as e:
-            print(f"Error in encrypt_for_recipient: {e}")
-            raise
-
-    def decrypt_location(self, encrypted_data):
-        try:
-            # Load ephemeral public key
-            ephemeral_public_key_pem = b64decode(encrypted_data["ephemeral_public_key"])
-            ephemeral_public_key = serialization.load_pem_public_key(
-                ephemeral_public_key_pem
-            )
-
-            # Generate shared secret
-            shared_key = self.private_key.exchange(ec.ECDH(), ephemeral_public_key)
-
-            # Derive encryption key
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            # Decode components
-            nonce = b64decode(encrypted_data["nonce"])
-            ciphertext = b64decode(encrypted_data["encrypted"])
-            tag = b64decode(encrypted_data["tag"])
-
-            # Create GCM cipher
-            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce, tag))
-            decryptor = cipher.decryptor()
-
-            # Decrypt and verify in one step
-            decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-
-            return json.loads(decrypted.decode())
-        except Exception as e:
-            print(f"Error decrypting location data: {e}")
-            raise
-
     def sign_message(self, message):
         if not self.private_key:
             raise ValueError("No private key available - not logged in?")
@@ -696,52 +529,6 @@ class Client:
         except Exception:
             return False
 
-    def get_public_key(self, username, callback=None):
-        """
-        Get the public key of another user
-
-        Args:
-            username: The username to get the public key for
-            callback: Optional callback function to call with the public key when received
-        """
-        print(f"DEBUG: Public key requested for {username}")
-
-        # Check if we already have the public key cached
-        if hasattr(self, "public_key_cache") and username in self.public_key_cache:
-            if callback:
-                print(f"DEBUG: Using cached key for {username}")
-                callback(self.public_key_cache[username])
-            return self.public_key_cache[username]
-
-        # Check if we're already waiting for this key
-        if hasattr(self, "pending_public_key_requests") and username in self.pending_public_key_requests:
-            if callback:
-                # Store multiple callbacks for the same username
-                print(f"DEBUG: Already waiting for key for {username}, adding callback")
-                old_callback = self.pending_public_key_requests[username]
-
-                # Create a combined callback that calls both the old and new callbacks
-                def combined_callback(key):
-                    old_callback(key)
-                    callback(key)
-
-                self.pending_public_key_requests[username] = combined_callback
-            return None
-
-        # Set up the callback BEFORE sending the request
-        if callback:
-            if not hasattr(self, "pending_public_key_requests"):
-                self.pending_public_key_requests = {}
-            print(f"DEBUG: Requesting key for {username} with callback")
-            self.pending_public_key_requests[username] = callback
-        else:
-            print(f"DEBUG: Requesting key for {username} without callback")
-
-        # Now send the request
-        request = json.dumps({"type": "get_public_key", "target": username})
-        self.send_message(request)
-
-        return None  # Will be available through callback
     def send_friend_request(self, friend_username):
         message = json.dumps(
             {"type": "friend_request", "from": self.username, "to": friend_username}
@@ -824,9 +611,7 @@ if __name__ == "__main__":
             print("7. View Friend Requests")
             print("8. Accept Friend Request")
             print("9. View Friends")
-            print("10. Send Message")
-            print("11. Check Messages")
-            print("12. Exit")
+            print("10. Exit")
             print("=" * 50 + "\n")  # Add separator line
             try:
                 choice = input("Choose an option: ")
@@ -846,12 +631,6 @@ if __name__ == "__main__":
                 elif choice == "9":
                     client.view_friend()
                 elif choice == "10":
-                    friend = input("Enter friend's username: ")
-                    msg = input("Enter message: ")
-                    client.msg_user(friend, msg)
-                elif choice == "11":
-                    client.check_messages()
-                elif choice == "12":
                     break
             except Exception as e:
                 print(f"Error: {e}")
