@@ -254,6 +254,7 @@ class Client:
 
                 message = json.loads(data)
                 message_type = message.get("type", "")
+                signature = message.get("signature")
 
                 if message_type == "registration_success":
                     print(message["message"])
@@ -290,17 +291,78 @@ class Client:
                         print("\nYour friends:", ", ".join(self.friends))
                     else:
                         print("\nYou have no friends yet.")
-                elif message_type == "location_request":
-                    from_client_id = message["from_client_id"]
-                    # Store the last request for use in send_location
-                    # Only update if request_data is present
+                elif message_type == "request_location":
+                    # Extract the signature
+                    signature = message.get("signature")
+                    if not signature:
+                        print("Warning: Received unsigned location_request message - discarding")
+                        continue
+
+                    # Identify the sender from the message
+                    sender = message.get("client_id")
+                    if not sender or sender not in self.friends:
+                        print(f"Warning: Message from unknown or non-friend sender: {sender}")
+                        continue
+
+                    # Prepare a copy without the signature for verification
+                    verify_msg = message.copy()
+                    verify_msg.pop("signature", None)
+
+                    # Request the sender's public key if not already available
+                    if not hasattr(self, "friend_public_keys") or sender not in self.friend_public_keys:
+                        self.request_friend_public_key(sender)
+                        print(f"Don't have public key for {sender}, cannot verify message")
+                        continue
+
+                    # Verify the signature
+                    if not self.verify_signature(verify_msg, signature, self.friend_public_keys[sender]):
+                        print(f"Warning: Invalid signature from {sender} - discarding message")
+                        continue
+
+                    print(f"✓ Verified location_request from {sender}")
+
+                    # Process the location request
                     if "request_data" in message:
                         self.last_request_data = message.get("request_data", {})
-                        self.send_location(from_client_id)
+                        self.last_request_signature = signature  # Optionally store signature for later verification
+                        self.send_location(sender)
                     else:
-                        print(f"Received location request without data from {from_client_id}")
-                elif message_type == "location_data":
-                    location = message["location"]
+                        print(f"Received location request without data from {sender}")
+
+                elif message_type == "location_response":
+                    # Extract the signature
+                    signature = message.get("signature")
+                    if not signature:
+                        print("Warning: Received unsigned location_data message - discarding")
+                        continue
+
+                    # For location_data, extract the sender from the response payload
+                    location_info = message.get("location", {})
+                    response_payload = location_info.get("response_payload", {})
+                    sender = response_payload.get("from_client_id")
+                    if not sender or sender not in self.friends:
+                        print(f"Warning: Message from unknown or non-friend sender: {sender}")
+                        continue
+
+                    # Prepare a copy without the signature for verification
+                    verify_msg = message.copy()
+                    verify_msg.pop("signature", None)
+
+                    # Ensure we have the sender's public key
+                    if not hasattr(self, "friend_public_keys") or sender not in self.friend_public_keys:
+                        self.request_friend_public_key(sender)
+                        print(f"Don't have public key for {sender}, cannot verify message")
+                        continue
+
+                    # Verify the signature
+                    if not self.verify_signature(verify_msg, signature, self.friend_public_keys[sender]):
+                        print(f"Warning: Invalid signature from {sender} - discarding message")
+                        continue
+
+                    print(f"✓ Verified location_data from {sender}")
+
+                    # Process the location data message
+                    location = message.get("location")
                     start_time = time.time()  # Start timer
                     is_same_cell = self.proximity_check_cell(location)
                     end_time = time.time()  # End timer
@@ -310,6 +372,26 @@ class Client:
                         print("Friend is nearby!")
                     else:
                         print("Friend is not nearby!")
+
+                elif message_type == "friend_public_key":
+                    friend_username = message.get("friend_username")
+                    public_key_data = message.get("public_key")
+
+                    if friend_username and public_key_data:
+                        # Initialize friend_public_keys if it doesn't exist
+                        if not hasattr(self, "friend_public_keys"):
+                            self.friend_public_keys = {}
+
+                        # Store the public key
+                        try:
+                            # Convert from PEM format to cryptography's public key object
+                            pem_data = b64decode(public_key_data)
+                            friend_public_key = serialization.load_pem_public_key(pem_data)
+                            self.friend_public_keys[friend_username] = friend_public_key
+                            print(f"Received and stored public key for {friend_username}")
+                        except Exception as e:
+                            print(f"Error processing friend's public key: {e}")
+
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
                 elif message_type == "location_update_success":
@@ -333,6 +415,24 @@ class Client:
         print("Stopped receiving messages.")
         self.close()
 
+    def request_friend_public_key(self, friend_username):
+        """Request a friend's public key from the server"""
+        if not self.is_logged_in:
+            return False
+
+        request = {
+            "type": "get_friend_public_key",
+            "username": self.username,
+            "friend_username": friend_username
+        }
+
+        try:
+            self.send_message(json.dumps(request))
+            return True
+        except Exception as e:
+            print(f"Error requesting friend's public key: {e}")
+            return False
+
     def request_location(self, target_client_id):
         if not self.is_logged_in:
             print("You must log in before requesting a location.")
@@ -345,42 +445,47 @@ class Client:
             print(f"You must be friends with {target_client_id} to request their location.")
             return
 
-        # Initialize Pierre protocol
+        # Initialize Pierre protocol and generate ephemeral key pair for this request
         pierre = PierreProtocol(resolution=1000)
-
-        # Generate key pair for this request
         public_key, private_key = pierre.generate_keypair()
         self.temp_private_key = private_key  # Store for later use
 
-        # Prepare request
-        request_data, _ = pierre.prepare_request(
-            self.x, self.y, public_key, private_key
-        )
-
-        # Add the public key to the request_data
+        # Prepare request data (includes encrypted grid data)
+        request_data, _ = pierre.prepare_request(self.x, self.y, public_key, private_key)
         request_data["public_key"] = serialize_public_key(public_key)
 
-        # Create request message
-        request_message = json.dumps({
+        # Create the request message dictionary
+        request_message_dict = {
             "type": "request_location",
             "client_id": self.username,
             "target_client_id": target_client_id,
-            "request_data": request_data
-        })
+            "request_data": request_data,
+        }
 
+        # Sign the request message (the signature covers the entire payload)
+        signature = self.sign_message(request_message_dict)
+        request_message_dict["signature"] = signature
+
+        # Serialize and send the message
+        request_message = json.dumps(request_message_dict)
         self.send_message(request_message)
         print(f"Location request sent to {target_client_id}")
 
     def send_location(self, from_client_id):
         try:
-            # Get the request data
+            # Retrieve the last received request data
             if not hasattr(self, "last_request_data") or not self.last_request_data:
                 print("No location request data available")
                 return
 
+            # Verify the request signature if not already verified in receive_messages
+            if not hasattr(self, "last_request_signature"):
+                print("Missing signature for request, cannot verify")
+                return
+
             request_data = self.last_request_data
 
-            # Get requester's public key from request data
+            # Obtain the requester's public key
             public_key_data = request_data.get("public_key")
             if not public_key_data:
                 print("Missing public key in request data")
@@ -391,37 +496,36 @@ class Client:
                 print("Failed to deserialize public key")
                 return
 
-            # Initialize Pierre protocol
+            # Initialize Pierre protocol and process the request to generate response data
             pierre = PierreProtocol(resolution=1000)
+            response_data = pierre.process_request(self.x, self.y, request_data, from_public_key)
 
-            # Process the request
-            response_data = pierre.process_request(
-                self.x, self.y,
-                request_data,  # Pass the full request_data
-                from_public_key
-            )
+            # Build the response payload
+            response_payload = {
+                "from_client_id": self.username,
+                "to_client_id": from_client_id,
+                "timestamp": int(time.time()),  # Add timestamp for freshness
+                "response_data": response_data,
+            }
 
-            # Create response message
-            response_message = json.dumps({
+            # Create the response message dictionary
+            response_message_dict = {
                 "type": "location_response",
                 "to_client_id": from_client_id,
-                "location": {
-                    "response_payload": {
-                        "from_client_id": self.username,
-                        "to_client_id": from_client_id,
-                        "timestamp": int(time.time()),
-                        "response_data": response_data
-                    }
-                }
-            })
+                "location": {"response_payload": response_payload},
+            }
 
+            # Sign the response message using our identity key
+            signature = self.sign_message(response_message_dict)
+            response_message_dict["signature"] = signature
+
+            # Serialize and send the response
+            response_message = json.dumps(response_message_dict)
             self.send_message(response_message)
             print(f"Location response sent to {from_client_id}")
 
         except Exception as e:
             print(f"Error in send_location: {e}")
-            import traceback
-            traceback.print_exc()
 
     # In the proximity_check_cell method, update to handle all three responses:
     def proximity_check_cell(self, location_data):
