@@ -46,14 +46,6 @@ class ServerState:
         self.clients_lock = RLock()
         self.pending_requests_lock = RLock()
 
-        # Documented lock order: users_lock -> friends_lock -> clients_lock -> pending_requests_lock
-        self.lock_order = {
-            'users_lock': 1,
-            'friends_lock': 2,
-            'clients_lock': 3,
-            'pending_requests_lock': 4
-        }
-
         self.load_all_data()
 
     def load_all_data(self):

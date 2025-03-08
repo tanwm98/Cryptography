@@ -186,12 +186,6 @@ class Client:
             self.private_key = ec.generate_private_key(ec.SECP256K1())
             public_key = self.private_key.public_key()
 
-            public_pem = public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-            public_key = self.private_key.public_key()
-
             # Serialize public key
             public_pem = public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
@@ -238,7 +232,7 @@ class Client:
                     session_key = b64decode(message["session_key"])
                     self.session_key = session_key
                     self.grid_location = SecureGridLocation()
-                    self.grid_location.key = session_key
+                    self.grid_location.set_key(session_key)
                     print(f"\nLogged in as {self.username}. Friends: {self.friends}")
                 elif message_type == "login_failed":
                     print(message["message"])
@@ -281,11 +275,6 @@ class Client:
                     print("Location updated successfully")
                 elif message_type == "success":
                     print(message["message"])
-                elif message_type == "friend_request_accepted":
-                    print(f"Friend request accepted by: {message['by']}")
-                    # Update friends list for both users
-                    self.friends = message.get("friends", [])
-                    print(f"Updated friends list: {self.friends}")
                 else:
                     print(f"Unknown message type received: {message_type}")
 
