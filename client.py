@@ -286,7 +286,30 @@ class Client:
                     print(f"Friend request accepted by: {message['by']}")
                     self.friends = message.get("friends", [])
                 elif message_type == "view_friends":
-                    self.friends = message.get("friends", [])
+                    self.friends = []
+                    friend_data = message.get("friends", [])
+
+                    # Initialize friend public keys dictionary if not exists
+                    if not hasattr(self, "friend_public_keys"):
+                        self.friend_public_keys = {}
+
+                    # Process friend list with public keys
+                    for friend_info in friend_data:
+                        username = friend_info.get("username")
+                        public_key = friend_info.get("public_key")
+
+                        if username:
+                            self.friends.append(username)
+
+                            # Store public key if provided
+                            if public_key:
+                                try:
+                                    pem_data = b64decode(public_key)
+                                    key_obj = serialization.load_pem_public_key(pem_data)
+                                    self.friend_public_keys[username] = key_obj
+                                except Exception as e:
+                                    print(f"Error processing {username}'s public key: {e}")
+
                     if self.friends:
                         print("\nYour friends:", ", ".join(self.friends))
                     else:

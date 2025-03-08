@@ -73,13 +73,21 @@ class ServerState:
                 except Exception as e:
                     print(f"Error loading users: {e}")
                     self.users = {}
+
     def load_friends(self):
         with self.friends_lock:
             self.friends = {}
             if os.path.exists(self.friends_file):
                 try:
                     with open(self.friends_file, "r") as f:
-                        self.friends = json.load(f)
+                        friends_data = json.load(f)
+
+                    # Convert from structured format back to simple lists
+                    # but keep public keys accessible
+                    for username, data in friends_data.items():
+                        self.friends[username] = []
+                        for friend_info in data.get("friends", []):
+                            self.friends[username].append(friend_info["username"])
                 except Exception as e:
                     print(f"Error loading friends: {e}")
 
@@ -100,7 +108,24 @@ class ServerState:
 
     def save_friends(self):
         with self.friends_lock:
-            self._save_data_atomic(self.friends_file, self.friends)
+            # Convert to a more structured format with public keys
+            friends_data = {}
+            for username, friend_list in self.friends.items():
+                friends_data[username] = {
+                    "friends": []
+                }
+                for friend in friend_list:
+                    # Get friend's public key from users
+                    with self.users_lock:
+                        friend_data = self.users.get(friend, {})
+                        public_key = friend_data.get("public_key", "")
+
+                    friends_data[username]["friends"].append({
+                        "username": friend,
+                        "public_key": public_key
+                    })
+
+            self._save_data_atomic(self.friends_file, friends_data)
 
     # Client session operations
     def add_client(self, username, session):
@@ -289,7 +314,21 @@ def handle_client(conn, addr, server_state: ServerState):
                                     response = {"type": "friend_added", "friend_username": friend_to_add, "message": f"{friend_to_add} added to {user}'s friend list."}
                     conn.sendall(json.dumps(response).encode("utf-8"))
                 elif message_type == "view_friends":
-                    response_message = {"type": "view_friends", "friends": server_state.friends.get(message["username"], [])}
+                    user_friends = server_state.friends.get(message["username"], [])
+                    friend_objects = []
+
+                    for friend in user_friends:
+                        # Get friend's public key from users
+                        with server_state.users_lock:
+                            friend_data = server_state.users.get(friend, {})
+                            public_key = friend_data.get("public_key", "")
+
+                        friend_objects.append({
+                            "username": friend,
+                            "public_key": public_key
+                        })
+
+                    response_message = {"type": "view_friends", "friends": friend_objects}
                     conn.sendall(json.dumps(response_message).encode("utf-8"))
                 elif message_type == "friend_request":
                     from_user = message["from"]
@@ -338,6 +377,14 @@ def handle_client(conn, addr, server_state: ServerState):
                             continue
                         server_state.remove_pending_request(to_user, from_user)
                     with server_state.friends_lock:
+                        # Get public keys
+                        with server_state.users_lock:
+                            from_user_data = server_state.users.get(from_user, {})
+                            to_user_data = server_state.users.get(to_user, {})
+                            from_user_public_key = from_user_data.get("public_key")
+                            to_user_public_key = to_user_data.get("public_key")
+
+                        # Add friend relationships
                         if to_user not in server_state.friends:
                             server_state.friends[to_user] = []
                         if from_user not in server_state.friends:
@@ -346,11 +393,19 @@ def handle_client(conn, addr, server_state: ServerState):
                             server_state.friends[to_user].append(from_user)
                         if to_user not in server_state.friends[from_user]:
                             server_state.friends[from_user].append(to_user)
-                        server_state.save_friends()
+
+                        server_state.save_friends()  # This will now save with public keys
+
+                    # Notify both users about the friendship
                     session_from = server_state.get_client(from_user)
                     if session_from:
                         try:
-                            notify = {"type": "friend_request_accepted", "by": to_user, "friends": server_state.friends.get(from_user, [])}
+                            notify = {
+                                "type": "friend_request_accepted",
+                                "by": to_user,
+                                "friends": server_state.friends.get(from_user, []),
+                                "friend_public_key": to_user_public_key
+                            }
                             session_from.connection.sendall(json.dumps(notify).encode("utf-8"))
                         except Exception as e:
                             print(f"Error notifying friend acceptance: {e}")
@@ -358,9 +413,25 @@ def handle_client(conn, addr, server_state: ServerState):
                     session_to = server_state.get_client(to_user)
                     if session_to:
                         try:
+                            # Create a proper friends list with objects instead of strings
+                            to_user_friends = server_state.friends.get(to_user, [])
+                            friend_objects = []
+
+                            # Convert simple list of usernames to list of objects with public keys
+                            for friend in to_user_friends:
+                                # Get friend's public key from users
+                                with server_state.users_lock:
+                                    friend_data = server_state.users.get(friend, {})
+                                    public_key = friend_data.get("public_key", "")
+
+                                friend_objects.append({
+                                    "username": friend,
+                                    "public_key": public_key
+                                })
+
                             update = {
                                 "type": "view_friends",
-                                "friends": server_state.friends.get(to_user, []),
+                                "friends": friend_objects,
                                 "message": "Friend list updated after accepting request"
                             }
                             session_to.connection.sendall(json.dumps(update).encode("utf-8"))
