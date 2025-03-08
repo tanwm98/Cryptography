@@ -2,8 +2,8 @@ import socket
 import json
 import threading
 import os
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding, ec
+from cryptography.hazmat.primitives import serialization, hashes, hmac
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64encode, b64decode
@@ -361,63 +361,78 @@ class Client:
         # Initialize Pierre protocol
         pierre = PierreProtocol(resolution=1000)
 
-        # Generate key pair for this request
+        # Generate an ephemeral key pair for this request using PierreProtocol
         public_key, private_key = pierre.generate_keypair()
-        self.temp_private_key = private_key  # Store for later use
+        # Store A's ephemeral private key for later shared secret derivation
+        self.temp_private_key = private_key
 
-        # Prepare request
-        request_data, _ = pierre.prepare_request(
-            self.x, self.y, public_key, private_key
-        )
+        # Prepare request (this may encrypt or process your location data)
+        request_data, _ = pierre.prepare_request(self.x, self.y, public_key, private_key)
 
-        # Add the public key to the request_data
+        # Embed A's ephemeral public key in the request data (serialized as JSON-serializable dict)
         request_data["public_key"] = serialize_public_key(public_key)
 
-        # Create request message
-        request_message = json.dumps({
+        # Create the request message dictionary
+        request_message_dict = {
             "type": "request_location",
             "client_id": self.username,
             "target_client_id": target_client_id,
-            "request_data": request_data
-        })
+            "request_data": request_data,
+            "timestamp": int(time.time())  # To prevent replay attacks
+        }
 
-        self.send_message(request_message)
-        print(f"Location request sent to {target_client_id}")
+        # Sign the message using your existing method (using your session key)
+        signature = self.sign_message(request_message_dict)
+        request_message_dict["signature"] = signature
+
+        # Send the request as a JSON string
+        self.send_message(json.dumps(request_message_dict))
 
     def send_location(self, from_client_id):
         try:
-            # Get the request data
+            # Retrieve the request data sent by Client A
             if not hasattr(self, "last_request_data") or not self.last_request_data:
                 print("No location request data available")
                 return
-
             request_data = self.last_request_data
 
-            # Get requester's public key from request data
-            public_key_data = request_data.get("public_key")
-            if not public_key_data:
-                print("Missing public key in request data")
+            # Extract Client A's ephemeral public key (serialized) from the request data
+            a_public_key_serialized = request_data.get("public_key")
+            if not a_public_key_serialized:
+                print("Missing ephemeral public key from requester")
                 return
 
-            from_public_key = deserialize_public_key(public_key_data)
-            if not from_public_key:
-                print("Failed to deserialize public key")
+            a_public_key = deserialize_public_key(a_public_key_serialized)
+            if not a_public_key:
+                print("Failed to deserialize requester's ephemeral public key")
                 return
 
-            # Initialize Pierre protocol
+            # Initialize Pierre protocol to process the location request
             pierre = PierreProtocol(resolution=1000)
+            response_data = pierre.process_request(self.x, self.y, request_data, a_public_key)
 
-            # Process the request
-            response_data = pierre.process_request(
-                self.x, self.y,
-                request_data,  # Pass the full request_data
-                from_public_key
-            )
+            # Generate B's ephemeral key pair using PierreProtocol (to ensure compatibility)
+            b_public_key, b_private_key = pierre.generate_keypair()
+            b_public_key_serialized = serialize_public_key(b_public_key)
 
-            # Create response message
-            response_message = json.dumps({
+            # Compute the shared secret as: shared_secret_point = a_public_key * b_private_key
+            shared_secret_point = a_public_key * b_private_key
+            shared_secret_int = shared_secret_point.x()
+            shared_secret_bytes = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, 'big')
+
+            # Derive the shared HMAC key from the shared secret using HKDF
+            shared_hmac_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b"location-hmac-key"
+            ).derive(shared_secret_bytes)
+
+            # Build the response message including B's ephemeral public key
+            response_message_dict = {
                 "type": "location_response",
                 "to_client_id": from_client_id,
+                "ephemeral_public_key": b_public_key_serialized,  # B's ephemeral public key
                 "location": {
                     "response_payload": {
                         "from_client_id": self.username,
@@ -426,49 +441,96 @@ class Client:
                         "response_data": response_data
                     }
                 }
-            })
+            }
 
-            self.send_message(response_message)
-            print(f"Location response sent to {from_client_id}")
+            # Sign the response using the shared HMAC key
+            h = hmac.HMAC(shared_hmac_key, hashes.SHA256())
+            h.update(json.dumps(response_message_dict, sort_keys=True).encode())
+            signature = b64encode(h.finalize()).decode("utf-8")
+            response_message_dict["signature"] = signature
 
+            # Send the signed response as JSON
+            self.send_message(json.dumps(response_message_dict))
         except Exception as e:
             print(f"Error in send_location: {e}")
             import traceback
             traceback.print_exc()
 
-    # In the proximity_check_cell method, update to handle all three responses:
+    def derive_shared_hmac_key(self, peer_public_key_serialized):
+        """
+        Helper function to derive a shared HMAC key using the stored ephemeral private key (from request)
+        and the peer's ephemeral public key (from the response).
+        """
+        peer_public_key = deserialize_public_key(peer_public_key_serialized)
+        if not peer_public_key:
+            print("Failed to deserialize peer's ephemeral public key")
+            return None
+        # Compute shared secret as: shared_secret_point = peer_public_key * self.temp_private_key
+        shared_secret_point = peer_public_key * self.temp_private_key
+        shared_secret_int = shared_secret_point.x()
+        shared_secret_bytes = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, 'big')
+        shared_hmac_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"location-hmac-key"
+        ).derive(shared_secret_bytes)
+        return shared_hmac_key
+
+    def verify_signature_with_shared_key(self, message, signature, peer_public_key_serialized):
+        """
+        Verifies an HMAC signature using a shared key derived from the ephemeral key exchange.
+        """
+        shared_hmac_key = self.derive_shared_hmac_key(peer_public_key_serialized)
+        if shared_hmac_key is None:
+            return False
+        h = hmac.HMAC(shared_hmac_key, hashes.SHA256())
+        h.update(json.dumps(message, sort_keys=True).encode())
+        try:
+            h.verify(b64decode(signature))
+            return True
+        except Exception as e:
+            print(f"HMAC verification failed: {e}")
+            return False
+
     def proximity_check_cell(self, location_data):
+        # Verify the signature using the ephemeral public key from the response
+        if "signature" in location_data:
+            peer_public_key_serialized = location_data.get("ephemeral_public_key")
+            if not peer_public_key_serialized:
+                print("Missing ephemeral public key in response for signature verification")
+                return False
+            signature = location_data["signature"]
+            # Create a copy of the message without the signature field
+            data_to_verify = location_data.copy()
+            del data_to_verify["signature"]
+            if not self.verify_signature_with_shared_key(data_to_verify, signature, peer_public_key_serialized):
+                print("Warning: Location data signature verification failed!")
+                return False
+
         try:
             response_payload = location_data.get("response_payload", {})
-
-            # Get the response data
             response_data = response_payload.get("response_data", {})
 
-            # Initialize Pierre protocol
+            # Initialize Pierre protocol for decryption
             pierre = PierreProtocol(resolution=1000)
-
-            # Check all three proximity levels
             same_cell_data = response_data.get("same_cell", {})
 
-            # Deserialize the ciphertexts
+            # Deserialize the ciphertext
             same_cell = pierre.deserialize_ciphertext(same_cell_data)
 
-            # Decrypt using the temporary private key
             start_time = time.time()  # Start timer
-
+            # Decrypt using the stored ephemeral private key from the request (Client A)
             same_cell_result = pierre.decrypt(self.temp_private_key, same_cell)
-
             end_time = time.time()  # End timer
-            print(f"Proximity check took {end_time - start_time:.6f} seconds")
 
-            # Check the results
+            print(f"Proximity check took {end_time - start_time:.6f} seconds")
             if same_cell_result == 0:
                 print("\nFriend is in the same cell!")
                 return True
             else:
                 print("\nFriend is not nearby!")
                 return False
-
         except Exception as e:
             print(f"Error in proximity check: {e}")
             import traceback
@@ -511,115 +573,45 @@ class Client:
         message = json.dumps({"type": "get_messages", "username": self.username})
         self.send_message(message)
 
-    def encrypt_for_recipient(
-        self, to_client_id, data, ephemeral_private, recipient_public_key
-    ):
-        try:
-            # Generate shared secret using ECDH
-            shared_key = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
-
-            # Derive separate keys for encryption and proof
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            proof_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-proof",
-            ).derive(shared_key)
-
-            # Generate random nonce for GCM
-            nonce = os.urandom(12)
-
-            # Create GCM cipher
-            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce))
-            encryptor = cipher.encryptor()
-
-            # Generate location proof using proof_key
-            data["proof"] = self.grid_location.generate_cell_proof(
-                self.x, self.y, data["timestamp"], proof_key  # Use proof_key here
-            )
-
-            # Convert data to bytes and encrypt
-            data_bytes = json.dumps(data).encode()
-            ciphertext = encryptor.update(data_bytes) + encryptor.finalize()
-
-            return {
-                "encrypted": b64encode(ciphertext).decode("utf-8"),
-                "nonce": b64encode(nonce).decode("utf-8"),
-                "tag": b64encode(encryptor.tag).decode("utf-8"),
-                "ephemeral_public_key": b64encode(
-                    ephemeral_private.public_key().public_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                    )
-                ).decode("utf-8"),
-            }
-        except Exception as e:
-            print(f"Error in encrypt_for_recipient: {e}")
-            raise
-
-    def decrypt_location(self, encrypted_data):
-        try:
-            # Load ephemeral public key
-            ephemeral_public_key_pem = b64decode(encrypted_data["ephemeral_public_key"])
-            ephemeral_public_key = serialization.load_pem_public_key(
-                ephemeral_public_key_pem
-            )
-
-            # Generate shared secret
-            shared_key = self.private_key.exchange(ec.ECDH(), ephemeral_public_key)
-
-            # Derive encryption key
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            # Decode components
-            nonce = b64decode(encrypted_data["nonce"])
-            ciphertext = b64decode(encrypted_data["encrypted"])
-            tag = b64decode(encrypted_data["tag"])
-
-            # Create GCM cipher
-            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce, tag))
-            decryptor = cipher.decryptor()
-
-            # Decrypt and verify in one step
-            decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-
-            return json.loads(decrypted.decode())
-        except Exception as e:
-            print(f"Error decrypting location data: {e}")
-            raise
-
     def sign_message(self, message):
-        if not self.private_key:
-            raise ValueError("No private key available - not logged in?")
+        """Sign a message using HMAC with the session key"""
+        if not self.session_key:
+            raise ValueError("No session key available - not logged in?")
 
-        signature = self.private_key.sign(
-            json.dumps(message).encode(),
-            ec.ECDSA(hashes.SHA256())
-        )
+        hmac_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"location-hmac-key"
+        ).derive(self.session_key)
+
+        # Create HMAC
+        h = hmac.HMAC(hmac_key, hashes.SHA256())
+        h.update(json.dumps(message, sort_keys=True).encode())
+        signature = h.finalize()
 
         return b64encode(signature).decode("utf-8")
 
-    def verify_signature(self, message, signature, sender_public_key):
-        if isinstance(sender_public_key, ec.EllipticCurvePublicKey):
-            sender_public_key.verify(
-                b64decode(signature),
-                json.dumps(message).encode(),
-                ec.ECDSA(hashes.SHA256())
-            )
+    def verify_signature(self, message, signature, sender_username):
+        """Verify a message signature using HMAC"""
+        try:
+            # Derive HMAC key
+            hmac_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b"location-hmac-key"
+            ).derive(self.session_key)
 
-        return None  # Will be available through callback
+            # Verify HMAC
+            h = hmac.HMAC(hmac_key, hashes.SHA256())
+            h.update(json.dumps(message, sort_keys=True).encode())
+            h.verify(b64decode(signature))
+            return True
+        except Exception as e:
+            print(f"HMAC verification failed: {e}")
+            return False
+
     def send_friend_request(self, friend_username):
         message = json.dumps(
             {"type": "friend_request", "from": self.username, "to": friend_username}

@@ -13,8 +13,6 @@ SERVER = "127.0.0.1"
 PORT = 65432
 
 # ----- Data Classes -----
-
-
 class ClientSession:
     def __init__(self, connection, username, public_key=None):
         self.connection = connection
@@ -130,18 +128,6 @@ class ServerState:
                 del self.clients[username]
                 print(f"Handled connection error for {username}")
 
-    def handle_get_public_key(self, message):
-        target = message["target"]
-        with self.users_lock:
-            user_data = self.users.get(target)
-            if user_data and "public_key" in user_data:
-                return {
-                    "type": "public_key_response",
-                    "public_key": user_data["public_key"],
-                    "key_created": user_data["key_created"]
-                }
-            return {"type": "error", "message": "Public key not found"}
-
     # Pending requests
     def add_pending_request(self, to_user, request):
         with self.pending_requests_lock:
@@ -156,20 +142,13 @@ class ServerState:
                     r for r in self.pending_requests[to_user] if r.from_user != from_user
                 ]
 
-    # Message queue operations
-    def add_message(self, username, message):
-        with self.message_queues_lock:
-            if username not in self.message_queues:
-                self.message_queues[username] = []
-            self.message_queues[username].append(message)
+    def get_client_session_key(self, client_id):
+        with self.clients_lock:
+            session = self.clients.get(client_id)
+            if session:
+                return session.session_key
+        return None
 
-    def get_messages(self, username):
-        with self.message_queues_lock:
-            messages = self.message_queues.get(username, [])
-            self.message_queues[username] = []
-            return messages
-
-# ----- Client Handler -----
 
 def handle_client(conn, addr, server_state: ServerState):
     print(f"Connected by {addr}")
