@@ -2,7 +2,7 @@ from base64 import b64encode, b64decode
 from ecdsa import SECP256k1
 from ecdsa.ellipticcurve import Point, INFINITY
 import secrets
-import json
+import json, random
 
 
 class PierreProtocol:
@@ -77,7 +77,7 @@ class PierreProtocol:
         if m_point == INFINITY:
             return 0
         else:
-            return 1
+            return m_point
 
     def homomorphic_add(self, ciphertext1, ciphertext2):
         """
@@ -104,12 +104,14 @@ class PierreProtocol:
         x_r, y_r = self.coordinates_to_cell(x, y)
 
         # Calculate the values to encrypt
-        xr_squared_plus_yr_squared = x_r ** 2 + y_r ** 2
+        xr_squared_plus_yr_squared = x_r**2 + y_r**2
         two_xr = 2 * x_r
         two_yr = 2 * y_r
 
         # Encrypt these values
-        encrypted_xr_squared_plus_yr_squared = self.encrypt(public_key, xr_squared_plus_yr_squared)
+        encrypted_xr_squared_plus_yr_squared = self.encrypt(
+            public_key, xr_squared_plus_yr_squared
+        )
         encrypted_2xr = self.encrypt(public_key, two_xr)
         encrypted_2yr = self.encrypt(public_key, two_yr)
 
@@ -117,10 +119,12 @@ class PierreProtocol:
         request_data = {
             "resolution": self.resolution,
             "encrypted_values": {
-                "xr_squared_plus_yr_squared": self.serialize_ciphertext(encrypted_xr_squared_plus_yr_squared),
+                "xr_squared_plus_yr_squared": self.serialize_ciphertext(
+                    encrypted_xr_squared_plus_yr_squared
+                ),
                 "two_xr": self.serialize_ciphertext(encrypted_2xr),
-                "two_yr": self.serialize_ciphertext(encrypted_2yr)
-            }
+                "two_yr": self.serialize_ciphertext(encrypted_2yr),
+            },
         }
 
         return request_data, private_key
@@ -134,36 +138,50 @@ class PierreProtocol:
 
         # Deserialize encrypted values
         encrypted_xr_squared_plus_yr_squared = self.deserialize_ciphertext(
-            encrypted_values.get("xr_squared_plus_yr_squared", {}))
-        encrypted_2xr = self.deserialize_ciphertext(
-            encrypted_values.get("two_xr", {}))
-        encrypted_2yr = self.deserialize_ciphertext(
-            encrypted_values.get("two_yr", {}))
+            encrypted_values.get("xr_squared_plus_yr_squared", {})
+        )  # (x_r**2 + y_r**2)
+        encrypted_2xr = self.deserialize_ciphertext(encrypted_values.get("two_xr", {}))
+        encrypted_2yr = self.deserialize_ciphertext(encrypted_values.get("two_yr", {}))
 
         # Convert Bob's coordinates to grid coordinates
         u_r, v_r = self.coordinates_to_cell(u, v)
 
         # Calculate terms for distance calculation
-        term1 = self.scalar_multiply(encrypted_2xr, -u_r)  # -2*x_r*u_r
-        term2 = self.scalar_multiply(encrypted_2yr, -v_r)  # -2*y_r*v_r
+        term1 = self.scalar_multiply(encrypted_2xr, -u_r)  # (-2·x_r·u_r)
+        term2 = self.scalar_multiply(encrypted_2yr, -v_r)  # (-2·y_r·v_r)
 
         # Add first three terms
         partial_sum = self.homomorphic_add(encrypted_xr_squared_plus_yr_squared, term1)
         partial_sum = self.homomorphic_add(partial_sum, term2)
 
         # Encrypt Bob's squared sum and add it
-        bob_term = self.encrypt(requester_public_key, u_r ** 2 + v_r ** 2)
-        dr_ciphertext = self.homomorphic_add(partial_sum, bob_term)
+        bob_term = self.encrypt(
+            requester_public_key, u_r**2 + v_r**2
+        )  # (u_r**2 + v_r**2)
+        # Sum to find Squared Distance
+        squared_dist = self.homomorphic_add(partial_sum, bob_term)
 
         # Generate random values for the protocol
         rho0 = secrets.randbelow(self.n - 1) + 1
+        rho1 = secrets.randbelow(self.n - 1) + 1
+        rho2 = secrets.randbelow(self.n - 1) + 1
 
         # Compute the three responses
-        same_cell = self.scalar_multiply(dr_ciphertext, rho0)
+        response_0 = self.scalar_multiply(squared_dist, rho0)  # E(ρ0·Dr)
+        response_1 = self.scalar_multiply(
+            self.homomorphic_add(squared_dist, self.encrypt(requester_public_key, -1)),
+            rho1,
+        )  # E(ρ1·(Dr−1))
+        response_2 = self.scalar_multiply(
+            self.homomorphic_add(squared_dist, self.encrypt(requester_public_key, -2)),
+            rho2,
+        )  # E(ρ2·(Dr−2))
 
         # Create response
         response_data = {
-            "same_cell": self.serialize_ciphertext(same_cell)
+            "response_0": self.serialize_ciphertext(response_0),
+            "response_1": self.serialize_ciphertext(response_1),
+            "response_2": self.serialize_ciphertext(response_2),
         }
 
         return response_data

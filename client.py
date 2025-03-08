@@ -22,6 +22,7 @@ PORT = 65432
 class NetworkError(Exception):
     pass
 
+
 # --- Updated Config with Atomic File Operations ---
 class Config:
     def __init__(self):
@@ -305,10 +306,14 @@ class Client:
                             if public_key:
                                 try:
                                     pem_data = b64decode(public_key)
-                                    key_obj = serialization.load_pem_public_key(pem_data)
+                                    key_obj = serialization.load_pem_public_key(
+                                        pem_data
+                                    )
                                     self.friend_public_keys[username] = key_obj
                                 except Exception as e:
-                                    print(f"Error processing {username}'s public key: {e}")
+                                    print(
+                                        f"Error processing {username}'s public key: {e}"
+                                    )
 
                     if self.friends:
                         print("\nYour friends:", ", ".join(self.friends))
@@ -318,13 +323,17 @@ class Client:
                     # Extract the signature
                     signature = message.get("signature")
                     if not signature:
-                        print("Warning: Received unsigned location_request message - discarding")
+                        print(
+                            "Warning: Received unsigned location_request message - discarding"
+                        )
                         continue
 
                     # Identify the sender from the message
                     sender = message.get("client_id")
                     if not sender or sender not in self.friends:
-                        print(f"Warning: Message from unknown or non-friend sender: {sender}")
+                        print(
+                            f"Warning: Message from unknown or non-friend sender: {sender}"
+                        )
                         continue
 
                     # Prepare a copy without the signature for verification
@@ -332,14 +341,23 @@ class Client:
                     verify_msg.pop("signature", None)
 
                     # Request the sender's public key if not already available
-                    if not hasattr(self, "friend_public_keys") or sender not in self.friend_public_keys:
+                    if (
+                        not hasattr(self, "friend_public_keys")
+                        or sender not in self.friend_public_keys
+                    ):
                         self.request_friend_public_key(sender)
-                        print(f"Don't have public key for {sender}, cannot verify message")
+                        print(
+                            f"Don't have public key for {sender}, cannot verify message"
+                        )
                         continue
 
                     # Verify the signature
-                    if not self.verify_signature(verify_msg, signature, self.friend_public_keys[sender]):
-                        print(f"Warning: Invalid signature from {sender} - discarding message")
+                    if not self.verify_signature(
+                        verify_msg, signature, self.friend_public_keys[sender]
+                    ):
+                        print(
+                            f"Warning: Invalid signature from {sender} - discarding message"
+                        )
                         continue
 
                     print(f"✓ Verified location_request from {sender}")
@@ -356,7 +374,9 @@ class Client:
                     # Extract the signature
                     signature = message.get("signature")
                     if not signature:
-                        print("Warning: Received unsigned location_data message - discarding")
+                        print(
+                            "Warning: Received unsigned location_data message - discarding"
+                        )
                         continue
 
                     # For location_data, extract the sender from the response payload
@@ -364,7 +384,9 @@ class Client:
                     response_payload = location_info.get("response_payload", {})
                     sender = response_payload.get("from_client_id")
                     if not sender or sender not in self.friends:
-                        print(f"Warning: Message from unknown or non-friend sender: {sender}")
+                        print(
+                            f"Warning: Message from unknown or non-friend sender: {sender}"
+                        )
                         continue
 
                     # Prepare a copy without the signature for verification
@@ -372,14 +394,23 @@ class Client:
                     verify_msg.pop("signature", None)
 
                     # Ensure we have the sender's public key
-                    if not hasattr(self, "friend_public_keys") or sender not in self.friend_public_keys:
+                    if (
+                        not hasattr(self, "friend_public_keys")
+                        or sender not in self.friend_public_keys
+                    ):
                         self.request_friend_public_key(sender)
-                        print(f"Don't have public key for {sender}, cannot verify message")
+                        print(
+                            f"Don't have public key for {sender}, cannot verify message"
+                        )
                         continue
 
                     # Verify the signature
-                    if not self.verify_signature(verify_msg, signature, self.friend_public_keys[sender]):
-                        print(f"Warning: Invalid signature from {sender} - discarding message")
+                    if not self.verify_signature(
+                        verify_msg, signature, self.friend_public_keys[sender]
+                    ):
+                        print(
+                            f"Warning: Invalid signature from {sender} - discarding message"
+                        )
                         continue
 
                     print(f"✓ Verified location_data from {sender}")
@@ -409,9 +440,13 @@ class Client:
                         try:
                             # Convert from PEM format to cryptography's public key object
                             pem_data = b64decode(public_key_data)
-                            friend_public_key = serialization.load_pem_public_key(pem_data)
+                            friend_public_key = serialization.load_pem_public_key(
+                                pem_data
+                            )
                             self.friend_public_keys[friend_username] = friend_public_key
-                            print(f"Received and stored public key for {friend_username}")
+                            print(
+                                f"Received and stored public key for {friend_username}"
+                            )
                         except Exception as e:
                             print(f"Error processing friend's public key: {e}")
 
@@ -446,7 +481,7 @@ class Client:
         request = {
             "type": "get_friend_public_key",
             "username": self.username,
-            "friend_username": friend_username
+            "friend_username": friend_username,
         }
 
         try:
@@ -462,10 +497,13 @@ class Client:
             return
         if target_client_id == self.username:
             print(
-                f"Your location is ({self.x}, {self.y}) in cell {self.grid_location.coordinates_to_cell(self.x, self.y)}")
+                f"Your location is ({self.x}, {self.y}) in cell {self.grid_location.coordinates_to_cell(self.x, self.y)}"
+            )
             return
         elif target_client_id not in self.friends:
-            print(f"You must be friends with {target_client_id} to request their location.")
+            print(
+                f"You must be friends with {target_client_id} to request their location."
+            )
             return
 
         # Initialize Pierre protocol and generate ephemeral key pair for this request
@@ -474,7 +512,9 @@ class Client:
         self.temp_private_key = private_key  # Store for later use
 
         # Prepare request data (includes encrypted grid data)
-        request_data, _ = pierre.prepare_request(self.x, self.y, public_key, private_key)
+        request_data, _ = pierre.prepare_request(
+            self.x, self.y, public_key, private_key
+        )
         request_data["public_key"] = serialize_public_key(public_key)
 
         # Create the request message dictionary
@@ -521,7 +561,9 @@ class Client:
 
             # Initialize Pierre protocol and process the request to generate response data
             pierre = PierreProtocol(resolution=1000)
-            response_data = pierre.process_request(self.x, self.y, request_data, from_public_key)
+            response_data = pierre.process_request(
+                self.x, self.y, request_data, from_public_key
+            )
 
             # Build the response payload
             response_payload = {
@@ -562,22 +604,35 @@ class Client:
             pierre = PierreProtocol(resolution=1000)
 
             # Check all three proximity levels
-            same_cell_data = response_data.get("same_cell", {})
+            response_0_serialized = response_data.get("response_0", {})
+            response_1_serialized = response_data.get("response_1", {})
+            response_2_serialized = response_data.get("response_2", {})
 
             # Deserialize the ciphertexts
-            same_cell = pierre.deserialize_ciphertext(same_cell_data)
+            response_0 = pierre.deserialize_ciphertext(response_0_serialized)
+            response_1 = pierre.deserialize_ciphertext(response_1_serialized)
+            response_2 = pierre.deserialize_ciphertext(response_2_serialized)
 
             # Decrypt using the temporary private key
             start_time = time.time()  # Start timer
 
-            same_cell_result = pierre.decrypt(self.temp_private_key, same_cell)
+            # Response will return 0 if Same, Adjacent or in Diagonal cell respectively
+            same_cell_result = pierre.decrypt(self.temp_private_key, response_0)
+            adjacent_cell_result = pierre.decrypt(self.temp_private_key, response_1)
+            diagonal_cell_result = pierre.decrypt(self.temp_private_key, response_2)
 
             end_time = time.time()  # End timer
             print(f"Proximity check took {end_time - start_time:.6f} seconds")
 
             # Check the results
-            if same_cell_result == 0:
-                print("\nFriend is in the same cell!")
+            if not same_cell_result:
+                print("\nFriend is in the Same Cell!")
+                return True
+            elif not adjacent_cell_result:
+                print("\nFriend is in an Adjacent Cell!")
+                return True
+            elif not diagonal_cell_result:
+                print("\nFriend is in a Diagonal Cell!")
                 return True
             else:
                 print("\nFriend is not nearby!")
@@ -586,6 +641,7 @@ class Client:
         except Exception as e:
             print(f"Error in proximity check: {e}")
             import traceback
+
             traceback.print_exc()
             return False
 
@@ -617,8 +673,7 @@ class Client:
         if isinstance(self.private_key, ec.EllipticCurvePrivateKey):
             # EC keys use a different signing mechanism
             signature = self.private_key.sign(
-                json.dumps(message).encode(),
-                ec.ECDSA(hashes.SHA256())
+                json.dumps(message).encode(), ec.ECDSA(hashes.SHA256())
             )
         else:
             # RSA keys use PSS padding
@@ -640,7 +695,7 @@ class Client:
                 sender_public_key.verify(
                     b64decode(signature),
                     json.dumps(message).encode(),
-                    ec.ECDSA(hashes.SHA256())
+                    ec.ECDSA(hashes.SHA256()),
                 )
             else:
                 sender_public_key.verify(
