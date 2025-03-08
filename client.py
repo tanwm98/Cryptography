@@ -1,18 +1,13 @@
 import socket
 import json
 import threading
-import os
 from cryptography.hazmat.primitives import serialization, hashes, hmac
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64encode, b64decode
-from argon2 import PasswordHasher
 import time
 from elgamal import PierreProtocol, serialize_public_key, deserialize_public_key
-import random
-
-ph = PasswordHasher()
+import traceback
 
 # Client configuration
 HOST = "127.0.0.1"
@@ -21,39 +16,6 @@ PORT = 65432
 
 class NetworkError(Exception):
     pass
-
-
-# --- Updated Config with Atomic File Operations ---
-class Config:
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.settings = {}
-        self.load_config()
-
-    def load_config(self):
-        with self.lock:
-            try:
-                with open("config.json", "r") as f:
-                    self.settings = json.load(f)
-            except FileNotFoundError:
-                self.settings = {}
-
-    def get(self, key, default=None):
-        with self.lock:
-            return self.settings.get(key, default)
-
-    def save_config(self):
-        with self.lock:
-            temp_file = "config.json.tmp"
-            try:
-                with open(temp_file, "w") as f:
-                    json.dump(self.settings, f)
-                os.replace(temp_file, "config.json")
-            except Exception as e:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                raise e
-
 
 class SecureGridLocation:
     def __init__(self, resolution=1000):
@@ -70,7 +32,7 @@ class SecureGridLocation:
         """Convert exact coordinates to grid cell coordinates"""
         cell_x = x // self.resolution
         cell_y = y // self.resolution
-        return (cell_x, cell_y)
+        return cell_x, cell_y
 
     def set_key(self, key):
         """Set encryption key"""
@@ -80,6 +42,7 @@ class SecureGridLocation:
 # --- Updated Client Class with Thread Safety and Enhanced Error Handling ---
 class Client:
     def __init__(self):
+        self.identity_private_key = None
         self.temp_private_key = None  # For storing temporary ElGamal private key
         self.last_request_data = None  # For storing location requests
         self.username = None
@@ -276,31 +239,28 @@ class Client:
                     self.session_key = session_key
                     self.grid_location = SecureGridLocation()
                     self.grid_location.key = session_key
-                    print(f"Logged in as {self.username}. Friends: {self.friends}")
+                    print(f"\nLogged in as {self.username}. Friends: {self.friends}")
                 elif message_type == "login_failed":
                     print(message["message"])
                 elif message_type == "friend_requests":
                     requests = message.get("requests", [])
-                    print("Pending friend requests:", requests)
+                    print("\nPending friend requests:", requests)
                 elif message_type == "friend_added":
                     print(message["message"])
                     if "friend_username" in message:
                         if message["friend_username"] not in self.friends:
                             self.friends.append(message["friend_username"])
                 elif message_type == "friend_request_received":
-                    print(f"Friend request received from: {message['from']}")
+                    print(f"\nFriend request received from: {message['from']}")
                 elif message_type == "friend_request_accepted":
-                    print(f"Friend request accepted by: {message['by']}")
+                    print(f"\nFriend request accepted by: {message['by']}")
                     self.friends = message.get("friends", [])
                 elif message_type == "view_friends":
                     self.friends = message.get("friends", [])
                     if self.friends:
-                        print("\nYour friends:", ", ".join(self.friends))
+                        print("\nYour Friends: " + "- ".join(self.friends))
                     else:
                         print("\nYou have no friends yet.")
-                elif message_type == "friend_request_accepted":
-                    self.friends = message.get("friends", [])
-                    print("\nFriend list updated:", ", ".join(self.friends))
                 elif message_type == "location_request":
                     from_client_id = message["from_client_id"]
                     # Store the last request for use in send_location
@@ -312,15 +272,7 @@ class Client:
                         print(f"Received location request without data from {from_client_id}")
                 elif message_type == "location_data":
                     location = message["location"]
-                    start_time = time.time()  # Start timer
-                    is_same_cell = self.proximity_check_cell(location)
-                    end_time = time.time()  # End timer
-                    print(f"Proximity check took {end_time - start_time:.6f} seconds")
-
-                    if is_same_cell:
-                        print("Friend is nearby!")
-                    else:
-                        print("Friend is not nearby!")
+                    self.proximity_check_cell(location)
 
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
@@ -453,7 +405,6 @@ class Client:
             self.send_message(json.dumps(response_message_dict))
         except Exception as e:
             print(f"Error in send_location: {e}")
-            import traceback
             traceback.print_exc()
 
     def derive_shared_hmac_key(self, peer_public_key_serialized):
@@ -524,15 +475,15 @@ class Client:
             same_cell_result = pierre.decrypt(self.temp_private_key, same_cell)
             end_time = time.time()  # End timer
 
-            print(f"Proximity check took {end_time - start_time:.6f} seconds")
+            print(f"\nProximity check took {end_time - start_time:.6f} seconds")
             if same_cell_result == 0:
-                print("\nFriend is in the same cell!")
+                print("\nFriend is nearby!")
                 return True
             else:
                 print("\nFriend is not nearby!")
                 return False
         except Exception as e:
-            print(f"Error in proximity check: {e}")
+            print(f"\nError in proximity check: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -557,22 +508,6 @@ class Client:
         message = json.dumps({"type": "view_friends", "username": self.username})
         self.send_message(message)
 
-    def msg_user(self, to_client_id, message_data):
-        response_message = json.dumps(
-            {
-                "type": "message_user",
-                "from_client_id": self.username,
-                "to_client_id": to_client_id,
-                "content": message_data,
-            }
-        )
-        self.send_message(response_message)
-        print(f"Sent message to client {to_client_id}")
-
-    def check_messages(self):
-        message = json.dumps({"type": "get_messages", "username": self.username})
-        self.send_message(message)
-
     def sign_message(self, message):
         """Sign a message using HMAC with the session key"""
         if not self.session_key:
@@ -591,26 +526,6 @@ class Client:
         signature = h.finalize()
 
         return b64encode(signature).decode("utf-8")
-
-    def verify_signature(self, message, signature, sender_username):
-        """Verify a message signature using HMAC"""
-        try:
-            # Derive HMAC key
-            hmac_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-hmac-key"
-            ).derive(self.session_key)
-
-            # Verify HMAC
-            h = hmac.HMAC(hmac_key, hashes.SHA256())
-            h.update(json.dumps(message, sort_keys=True).encode())
-            h.verify(b64decode(signature))
-            return True
-        except Exception as e:
-            print(f"HMAC verification failed: {e}")
-            return False
 
     def send_friend_request(self, friend_username):
         message = json.dumps(
