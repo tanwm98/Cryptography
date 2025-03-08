@@ -12,7 +12,7 @@ ph = PasswordHasher()
 SERVER = "127.0.0.1"
 PORT = 65432
 
-# ----- Data Classes -----
+
 class ClientSession:
     def __init__(self, connection, username, public_key=None):
         self.connection = connection
@@ -71,6 +71,7 @@ class ServerState:
                 except Exception as e:
                     print(f"Error loading users: {e}")
                     self.users = {}
+
     def load_friends(self):
         with self.friends_lock:
             self.friends = {}
@@ -142,13 +143,6 @@ class ServerState:
                     r for r in self.pending_requests[to_user] if r.from_user != from_user
                 ]
 
-    def get_client_session_key(self, client_id):
-        with self.clients_lock:
-            session = self.clients.get(client_id)
-            if session:
-                return session.session_key
-        return None
-
 
 def handle_client(conn, addr, server_state: ServerState):
     print(f"Connected by {addr}")
@@ -191,7 +185,7 @@ def handle_client(conn, addr, server_state: ServerState):
                 elif message_type == "login":
                     username = message["username"]
                     password = message["password"]
-                    session_public_key  = message.get("session_public_key")
+                    session_public_key = message.get("session_public_key")
                     with server_state.users_lock:
                         user_data = server_state.users.get(username)
                         if user_data and "password" in user_data:
@@ -232,10 +226,11 @@ def handle_client(conn, addr, server_state: ServerState):
                             conn.sendall(json.dumps(response).encode("utf-8"))
                             return
 
-                    # Update grid size to 100x100
                     target_session = server_state.get_client(target_client_id)
                     if target_session:
-                        request_message = {"type": "location_request", "from_client_id": requesting_client_id, "request_data": request_data}
+                        request_message = {"type": "location_request",
+                                           "from_client_id": requesting_client_id,
+                                           "request_data": request_data}
                         try:
                             target_session.connection.sendall(json.dumps(request_message).encode("utf-8"))
                         except Exception as e:
@@ -277,6 +272,7 @@ def handle_client(conn, addr, server_state: ServerState):
                                     server_state.save_friends()
                                     response = {"type": "friend_added", "friend_username": friend_to_add, "message": f"{friend_to_add} added to {user}'s friend list."}
                     conn.sendall(json.dumps(response).encode("utf-8"))
+
                 elif message_type == "view_friends":
                     response_message = {"type": "view_friends", "friends": server_state.friends.get(message["username"], [])}
                     conn.sendall(json.dumps(response_message).encode("utf-8"))
@@ -340,7 +336,9 @@ def handle_client(conn, addr, server_state: ServerState):
                     session_from = server_state.get_client(from_user)
                     if session_from:
                         try:
-                            notify = {"type": "friend_request_accepted", "by": to_user, "friends": server_state.friends.get(from_user, [])}
+                            notify = {"type": "friend_request_accepted",
+                                      "by": to_user,
+                                      "friends": server_state.friends.get(from_user, [])}
                             session_from.connection.sendall(json.dumps(notify).encode("utf-8"))
                         except Exception as e:
                             print(f"Error notifying friend acceptance: {e}")
@@ -402,7 +400,6 @@ def handle_client(conn, addr, server_state: ServerState):
             print(f"Error closing connection: {e}")
 
 
-# ----- Session Cleanup Task -----
 def session_cleanup_task(server_state, timeout=3600, interval=60):
     while True:
         time.sleep(interval)
@@ -418,7 +415,6 @@ def session_cleanup_task(server_state, timeout=3600, interval=60):
                     print(f"Session timeout for {username}")
 
 
-# ----- Server Startup -----
 def start_server(server_state, host=SERVER, port=PORT):
     cleanup_thread = threading.Thread(target=session_cleanup_task, args=(server_state,), daemon=True)
     cleanup_thread.start()
