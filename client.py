@@ -1,18 +1,16 @@
 import socket
 import json
 import threading
-import time
-from math import sqrt
 import os
-from cryptography.exceptions import InvalidKey
 from cryptography.hazmat.primitives import serialization, hashes, hmac
-from cryptography.hazmat.primitives import padding as symmetric_padding
-from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding, ec
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64encode, b64decode
 from argon2 import PasswordHasher
 import time
+from elgamal import PierreProtocol, serialize_public_key, deserialize_public_key
+import random
 
 ph = PasswordHasher()
 
@@ -23,27 +21,6 @@ PORT = 65432
 
 class NetworkError(Exception):
     pass
-
-
-# --- Updated MessageQueue with Locking ---
-class MessageQueue:
-    def __init__(self):
-        self.messages = {}
-        self.lock = threading.RLock()
-
-    def add_message(self, to_user, message):
-        with self.lock:
-            if to_user not in self.messages:
-                self.messages[to_user] = []
-            self.messages[to_user].append(
-                {"content": message, "timestamp": time.time()}
-            )
-
-    def get_messages(self, user):
-        with self.lock:
-            messages = self.messages.get(user, [])
-            self.messages[user] = []  # Clear after reading
-            return messages
 
 
 # --- Updated Config with Atomic File Operations ---
@@ -78,59 +55,33 @@ class Config:
                 raise e
 
 
-# --- SecureGridLocation remains largely the same ---
 class SecureGridLocation:
     def __init__(self, resolution=1000):
+        """
+        Initialize with a resolution
+
+        Args:
+            resolution: Grid cell size (default 1000)
+        """
         self.resolution = resolution
+        self.key = None
 
     def coordinates_to_cell(self, x, y):
-        return (x // self.resolution, y // self.resolution)
+        """Convert exact coordinates to grid cell coordinates"""
+        cell_x = x // self.resolution
+        cell_y = y // self.resolution
+        return (cell_x, cell_y)
 
-    def generate_cell_proof(self, x, y, timestamp, key):
-        h = hmac.HMAC(key, hashes.SHA256())
-        msg = f"{x},{y},{timestamp}".encode()
-        h.update(msg)
-        return b64encode(h.finalize()).decode("utf-8")
-
-    def verify_cell_proof(self, coord_x, coord_y, proof, timestamp, key):
-        try:
-            print("\nDEBUG - Starting cell proof verification")
-            print(f"DEBUG - Checking cell ({coord_x}, {coord_y})")
-            print(f"DEBUG - Timestamp: {timestamp}")
-
-            # Add timestamp freshness check
-            current_time = int(time.time())
-            max_age = 30  # 30 seconds
-            if abs(current_time - timestamp) > max_age:
-                print(
-                    f"DEBUG - ✗ Timestamp too old: {current_time - timestamp} seconds"
-                )
-                return False
-
-            h = hmac.HMAC(key, hashes.SHA256())
-            msg = f"{coord_x},{coord_y},{timestamp}".encode()
-            print(f"DEBUG - Verification message: {msg}")
-
-            h.update(msg)
-            try:
-                h.verify(b64decode(proof))
-                print("DEBUG - ✓ Cell proof verification successful")
-                return True
-            except InvalidKey:
-                print("DEBUG - ✗ Cell proof verification failed - Invalid key")
-                return False
-            except Exception as e:
-                print(f"DEBUG - ✗ Cell proof verification failed: {e}")
-                return False
-
-        except Exception as e:
-            print(f"DEBUG - ✗ Error in verify_cell_proof: {e}")
-            return False
+    def set_key(self, key):
+        """Set encryption key"""
+        self.key = key
 
 
 # --- Updated Client Class with Thread Safety and Enhanced Error Handling ---
 class Client:
     def __init__(self):
+        self.temp_private_key = None  # For storing temporary ElGamal private key
+        self.last_request_data = None  # For storing location requests
         self.username = None
         self.x = 0
         self.y = 0
@@ -143,11 +94,9 @@ class Client:
         self.grid_location = None
         # Thread safety locks
         self.friends_lock = threading.RLock()
-        self.message_queue_lock = threading.RLock()
         self.connection_lock = threading.RLock()
         self.stop_flag = threading.Event()  # Flag to signal the thread to stop
         # Use an instance of MessageQueue for queued messages
-        self.message_queue = MessageQueue()
 
     # --- Connection Management Methods ---
     def send_message(self, message):
@@ -201,14 +150,13 @@ class Client:
             x = int(input("Enter your x coordinate (0-99999): "))
             y = int(input("Enter your y coordinate (0-99999): "))
             if 0 <= x <= 99999 and 0 <= y <= 99999:
-                print("\nDEBUG - Setting local location")
-                print(f"DEBUG - New coordinates: ({x}, {y})")
+                print(f"New coordinates: ({x}, {y})")
 
                 self.x = x
                 self.y = y
                 cell = self.grid_location.coordinates_to_cell(x, y)
-                print(f"DEBUG - New cell: ({cell[0]}, {cell[1]})")
-                print("DEBUG - Location updated locally")
+                print(f"New cell: ({cell[0]}, {cell[1]})")
+                print("Location updated locally")
                 return True
             else:
                 raise ValueError
@@ -305,7 +253,7 @@ class Client:
     def receive_messages(self):
         while self.is_running:
             try:
-                data = self.socket.recv(1024).decode("utf-8")
+                data = self.socket.recv(4096).decode("utf-8")
                 if not data:
                     self.stop_flag.set()
                     print("Server connection closed")
@@ -314,9 +262,6 @@ class Client:
 
                 message = json.loads(data)
                 message_type = message.get("type", "")
-
-                # Print all server responses for debugging
-                print(f"\nServer response: {message}")
 
                 if message_type == "registration_success":
                     print(message["message"])
@@ -356,35 +301,30 @@ class Client:
                 elif message_type == "friend_request_accepted":
                     self.friends = message.get("friends", [])
                     print("\nFriend list updated:", ", ".join(self.friends))
-                elif message_type == "received_message":
-                    print(
-                        f"\nMessage from {message['from_client_id']}: {message['content']}"
-                    )
                 elif message_type == "location_request":
                     from_client_id = message["from_client_id"]
-                    self.send_location(from_client_id)
+                    # Store the last request for use in send_location
+                    # Only update if request_data is present
+                    if "request_data" in message:
+                        self.last_request_data = message.get("request_data", {})
+                        self.send_location(from_client_id)
+                    else:
+                        print(f"Received location request without data from {from_client_id}")
                 elif message_type == "location_data":
                     location = message["location"]
-
                     start_time = time.time()  # Start timer
                     is_same_cell = self.proximity_check_cell(location)
                     end_time = time.time()  # End timer
                     print(f"Proximity check took {end_time - start_time:.6f} seconds")
 
                     if is_same_cell:
-                        print("Friend is nearby! (Same Cell)")
+                        print("Friend is nearby!")
                     else:
                         print("Friend is not nearby!")
+
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
-                elif message_type == "queued_messages":
-                    messages = message.get("messages", [])
-                    if messages:
-                        print("\nQueued messages:")
-                        for msg in messages:
-                            print(f"From {msg['from']}: {msg['content']}")
-                    else:
-                        print("No queued messages")
+
                 elif message_type == "location_update_success":
                     print("Location updated successfully")
                 elif message_type == "success":
@@ -412,171 +352,189 @@ class Client:
             return
         if target_client_id == self.username:
             print(
-                f"Your current location is ({self.x}, {self.y}) in cell ({self.x // 1000}, {self.y // 1000})"
-            )
+                f"Your location is ({self.x}, {self.y}) in cell {self.grid_location.coordinates_to_cell(self.x, self.y)}")
             return
-        with self.friends_lock:
-            if target_client_id not in self.friends:
-                print("You must be friends to view their location.")
-                return
-        request_message = json.dumps(
-            {
-                "type": "request_location",
-                "client_id": self.username,
-                "target_client_id": target_client_id,
-            }
-        )
-        self.send_message(request_message)
-        print(f"Requested location from client {target_client_id}")
+        elif target_client_id not in self.friends:
+            print(f"You must be friends with {target_client_id} to request their location.")
+            return
 
-    def send_location(self, to_client_id):
-        if not self.grid_location:
-            print("Error: Grid location system not initialized")
-            return
+        # Initialize Pierre protocol
+        pierre = PierreProtocol(resolution=1000)
+
+        # Generate an ephemeral key pair for this request using PierreProtocol
+        public_key, private_key = pierre.generate_keypair()
+        # Store A's ephemeral private key for later shared secret derivation
+        self.temp_private_key = private_key
+
+        # Prepare request (this may encrypt or process your location data)
+        request_data, _ = pierre.prepare_request(self.x, self.y, public_key, private_key)
+
+        # Embed A's ephemeral public key in the request data (serialized as JSON-serializable dict)
+        request_data["public_key"] = serialize_public_key(public_key)
+
+        # Create the request message dictionary
+        request_message_dict = {
+            "type": "request_location",
+            "client_id": self.username,
+            "target_client_id": target_client_id,
+            "request_data": request_data,
+            "timestamp": int(time.time())  # To prevent replay attacks
+        }
+
+        # Sign the message using your existing method (using your session key)
+        signature = self.sign_message(request_message_dict)
+        request_message_dict["signature"] = signature
+
+        # Send the request as a JSON string
+        self.send_message(json.dumps(request_message_dict))
+
+    def send_location(self, from_client_id):
         try:
-            timestamp = int(time.time())
+            # Retrieve the request data sent by Client A
+            if not hasattr(self, "last_request_data") or not self.last_request_data:
+                print("No location request data available")
+                return
+            request_data = self.last_request_data
 
-            # Get recipient's public key first
-            try:
-                recipient_public_key = self.get_public_key(to_client_id)
-            except Exception as e:
-                print(f"Failed to get verified public key: {e}")
+            # Extract Client A's ephemeral public key (serialized) from the request data
+            a_public_key_serialized = request_data.get("public_key")
+            if not a_public_key_serialized:
+                print("Missing ephemeral public key from requester")
                 return
 
-            # Generate ephemeral key and derive shared key
-            ephemeral_private = ec.generate_private_key(ec.SECP256K1())
+            a_public_key = deserialize_public_key(a_public_key_serialized)
+            if not a_public_key:
+                print("Failed to deserialize requester's ephemeral public key")
+                return
 
-            shared_key = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
+            # Initialize Pierre protocol to process the location request
+            pierre = PierreProtocol(resolution=1000)
+            response_data = pierre.process_request(self.x, self.y, request_data, a_public_key)
 
-            # Derive key for both encryption and proof
-            derived_key = HKDF(
+            # Generate B's ephemeral key pair using PierreProtocol (to ensure compatibility)
+            b_public_key, b_private_key = pierre.generate_keypair()
+            b_public_key_serialized = serialize_public_key(b_public_key)
+
+            # Compute the shared secret as: shared_secret_point = a_public_key * b_private_key
+            shared_secret_point = a_public_key * b_private_key
+            shared_secret_int = shared_secret_point.x()
+            shared_secret_bytes = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, 'big')
+
+            # Derive the shared HMAC key from the shared secret using HKDF
+            shared_hmac_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
                 salt=None,
-                info=b"location-sharing",
-            ).derive(shared_key)
+                info=b"location-hmac-key"
+            ).derive(shared_secret_bytes)
 
-            # Generate location data with proof using derived key
-            location_data = {
-                "coord_x": self.x,
-                "coord_y": self.y,
-                "timestamp": timestamp,
-                "proof": self.grid_location.generate_cell_proof(
-                    self.x, self.y, timestamp, derived_key
-                ),
-            }
-
-            # Encrypt location data
-            encrypted_location = self.encrypt_for_recipient(
-                to_client_id, location_data, ephemeral_private, recipient_public_key
-            )
-
-            response_message = json.dumps(
-                {
-                    "type": "location_response",
-                    "to_client_id": to_client_id,
-                    "location": encrypted_location,
+            # Build the response message including B's ephemeral public key
+            response_message_dict = {
+                "type": "location_response",
+                "to_client_id": from_client_id,
+                "ephemeral_public_key": b_public_key_serialized,  # B's ephemeral public key
+                "location": {
+                    "response_payload": {
+                        "from_client_id": self.username,
+                        "to_client_id": from_client_id,
+                        "timestamp": int(time.time()),
+                        "response_data": response_data
+                    }
                 }
-            )
-            self.send_message(response_message)
+            }
 
+            # Sign the response using the shared HMAC key
+            h = hmac.HMAC(shared_hmac_key, hashes.SHA256())
+            h.update(json.dumps(response_message_dict, sort_keys=True).encode())
+            signature = b64encode(h.finalize()).decode("utf-8")
+            response_message_dict["signature"] = signature
+
+            # Send the signed response as JSON
+            self.send_message(json.dumps(response_message_dict))
         except Exception as e:
-            print(f"DEBUG - Error in send_location: {e}")
+            print(f"Error in send_location: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def proximity_check_cell(self, encrypted_location):
+    def derive_shared_hmac_key(self, peer_public_key_serialized):
+        """
+        Helper function to derive a shared HMAC key using the stored ephemeral private key (from request)
+        and the peer's ephemeral public key (from the response).
+        """
+        peer_public_key = deserialize_public_key(peer_public_key_serialized)
+        if not peer_public_key:
+            print("Failed to deserialize peer's ephemeral public key")
+            return None
+        # Compute shared secret as: shared_secret_point = peer_public_key * self.temp_private_key
+        shared_secret_point = peer_public_key * self.temp_private_key
+        shared_secret_int = shared_secret_point.x()
+        shared_secret_bytes = shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, 'big')
+        shared_hmac_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"location-hmac-key"
+        ).derive(shared_secret_bytes)
+        return shared_hmac_key
+
+    def verify_signature_with_shared_key(self, message, signature, peer_public_key_serialized):
+        """
+        Verifies an HMAC signature using a shared key derived from the ephemeral key exchange.
+        """
+        shared_hmac_key = self.derive_shared_hmac_key(peer_public_key_serialized)
+        if shared_hmac_key is None:
+            return False
+        h = hmac.HMAC(shared_hmac_key, hashes.SHA256())
+        h.update(json.dumps(message, sort_keys=True).encode())
         try:
-            print("\nDEBUG - Starting proximity check with detailed logging")
-            print(
-                f"DEBUG - My current location: cell ({self.x // 1000}, {self.y // 1000})"
-            )
-            print("DEBUG - Steps:")
-
-            # Step 1: Load ephemeral key
-            print("DEBUG - 1. Loading ephemeral public key...")
-            ephemeral_public_key_pem = b64decode(
-                encrypted_location["ephemeral_public_key"]
-            )
-            ephemeral_public_key = serialization.load_pem_public_key(
-                ephemeral_public_key_pem
-            )
-            print("DEBUG - ✓ Ephemeral key loaded successfully")
-
-            # Step 2: Generate shared key
-            print("DEBUG - 2. Generating shared key...")
-            shared_key = self.private_key.exchange(ec.ECDH(), ephemeral_public_key)
-            print("DEBUG - ✓ Shared key generated")
-
-            # Step 3: Derive separate keys
-            print("DEBUG - 3. Deriving separate keys using HKDF...")
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            proof_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-proof",
-            ).derive(shared_key)
-            print("DEBUG - ✓ Keys derived successfully")
-
-            # Step 4: Decrypt with GCM
-            print("DEBUG - 4. Starting GCM decryption and authentication...")
-            try:
-                nonce = b64decode(encrypted_location["nonce"])
-                ciphertext = b64decode(encrypted_location["encrypted"])
-                tag = b64decode(encrypted_location["tag"])
-
-                cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce, tag))
-                decryptor = cipher.decryptor()
-                decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-                location = json.loads(decrypted.decode())
-                print("DEBUG - ✓ GCM authentication and decryption successful")
-            except Exception as e:
-                print(f"DEBUG - ✗ GCM authentication or decryption failed: {e}")
-                return False
-
-            # Step 5: Verify proof using proof_key
-            print("DEBUG - 5. Verifying location proof...")
-            try:
-                if not self.grid_location.verify_cell_proof(
-                    location["coord_x"],
-                    location["coord_y"],
-                    location["proof"],
-                    location["timestamp"],
-                    proof_key,  # Use proof_key here
-                ):
-                    print("DEBUG - ✗ Location proof verification failed")
-                    return False, False
-                print("DEBUG - ✓ Location proof verified")
-            except Exception as e:
-                print(f"DEBUG - ✗ Error during proof verification: {e}")
-                return False
-
-            # Step 6: Check proximity
-            print("DEBUG - 6. Checking cell proximity...")
-            is_same_cell = False
-            my_cell = self.grid_location.coordinates_to_cell(self.x, self.y)
-            their_cell = self.grid_location.coordinates_to_cell(
-                location["coord_x"], location["coord_y"]
-            )
-            dx = abs(my_cell[0] - their_cell[0])
-            dy = abs(my_cell[1] - their_cell[1])
-
-            print(f"DEBUG - My cell: {my_cell}")
-            print(f"DEBUG - Their cell: {their_cell}")
-
-            is_same_cell = dx == 0 and dy == 0
-            return is_same_cell
-
+            h.verify(b64decode(signature))
+            return True
         except Exception as e:
-            print("\nDEBUG - Unexpected error in proximity_check_cell:")
-            print(f"DEBUG - Error type: {type(e).__name__}")
-            print(f"DEBUG - Error message: {str(e)}")
-            print(f"DEBUG - Error location: {e.__traceback__.tb_frame.f_code.co_name}")
+            print(f"HMAC verification failed: {e}")
+            return False
+
+    def proximity_check_cell(self, location_data):
+        # Verify the signature using the ephemeral public key from the response
+        if "signature" in location_data:
+            peer_public_key_serialized = location_data.get("ephemeral_public_key")
+            if not peer_public_key_serialized:
+                print("Missing ephemeral public key in response for signature verification")
+                return False
+            signature = location_data["signature"]
+            # Create a copy of the message without the signature field
+            data_to_verify = location_data.copy()
+            del data_to_verify["signature"]
+            if not self.verify_signature_with_shared_key(data_to_verify, signature, peer_public_key_serialized):
+                print("Warning: Location data signature verification failed!")
+                return False
+
+        try:
+            response_payload = location_data.get("response_payload", {})
+            response_data = response_payload.get("response_data", {})
+
+            # Initialize Pierre protocol for decryption
+            pierre = PierreProtocol(resolution=1000)
+            same_cell_data = response_data.get("same_cell", {})
+
+            # Deserialize the ciphertext
+            same_cell = pierre.deserialize_ciphertext(same_cell_data)
+
+            start_time = time.time()  # Start timer
+            # Decrypt using the stored ephemeral private key from the request (Client A)
+            same_cell_result = pierre.decrypt(self.temp_private_key, same_cell)
+            end_time = time.time()  # End timer
+
+            print(f"Proximity check took {end_time - start_time:.6f} seconds")
+            if same_cell_result == 0:
+                print("\nFriend is in the same cell!")
+                return True
+            else:
+                print("\nFriend is not nearby!")
+                return False
+        except Exception as e:
+            print(f"Error in proximity check: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def add_friend(self, friend_username):
@@ -615,138 +573,44 @@ class Client:
         message = json.dumps({"type": "get_messages", "username": self.username})
         self.send_message(message)
 
-    def encrypt_for_recipient(
-        self, to_client_id, data, ephemeral_private, recipient_public_key
-    ):
-        try:
-            # Generate shared secret using ECDH
-            shared_key = ephemeral_private.exchange(ec.ECDH(), recipient_public_key)
-
-            # Derive separate keys for encryption and proof
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            proof_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-proof",
-            ).derive(shared_key)
-
-            # Generate random nonce for GCM
-            nonce = os.urandom(12)
-
-            # Create GCM cipher
-            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce))
-            encryptor = cipher.encryptor()
-
-            # Generate location proof using proof_key
-            data["proof"] = self.grid_location.generate_cell_proof(
-                self.x, self.y, data["timestamp"], proof_key  # Use proof_key here
-            )
-
-            # Convert data to bytes and encrypt
-            data_bytes = json.dumps(data).encode()
-            ciphertext = encryptor.update(data_bytes) + encryptor.finalize()
-
-            return {
-                "encrypted": b64encode(ciphertext).decode("utf-8"),
-                "nonce": b64encode(nonce).decode("utf-8"),
-                "tag": b64encode(encryptor.tag).decode("utf-8"),
-                "ephemeral_public_key": b64encode(
-                    ephemeral_private.public_key().public_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                    )
-                ).decode("utf-8"),
-            }
-        except Exception as e:
-            print(f"DEBUG - Error in encrypt_for_recipient: {e}")
-            raise
-
-    def decrypt_location(self, encrypted_data):
-        try:
-            # Load ephemeral public key
-            ephemeral_public_key_pem = b64decode(encrypted_data["ephemeral_public_key"])
-            ephemeral_public_key = serialization.load_pem_public_key(
-                ephemeral_public_key_pem
-            )
-
-            # Generate shared secret
-            shared_key = self.private_key.exchange(ec.ECDH(), ephemeral_public_key)
-
-            # Derive encryption key
-            encryption_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=None,
-                info=b"location-sharing-encryption",
-            ).derive(shared_key)
-
-            # Decode components
-            nonce = b64decode(encrypted_data["nonce"])
-            ciphertext = b64decode(encrypted_data["encrypted"])
-            tag = b64decode(encrypted_data["tag"])
-
-            # Create GCM cipher
-            cipher = Cipher(algorithms.AES(encryption_key), modes.GCM(nonce, tag))
-            decryptor = cipher.decryptor()
-
-            # Decrypt and verify in one step
-            decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-
-            return json.loads(decrypted.decode())
-        except Exception as e:
-            print(f"Error decrypting location data: {e}")
-            raise
-
     def sign_message(self, message):
-        if not self.private_key:
-            raise ValueError("No private key available - not logged in?")
-        signature = self.private_key.sign(
-            json.dumps(message).encode(),
-            asymmetric_padding.PSS(
-                mgf=asymmetric_padding.MGF1(hashes.SHA256()),
-                salt_length=asymmetric_padding.PSS.MAX_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
+        """Sign a message using HMAC with the session key"""
+        if not self.session_key:
+            raise ValueError("No session key available - not logged in?")
+
+        hmac_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"location-hmac-key"
+        ).derive(self.session_key)
+
+        # Create HMAC
+        h = hmac.HMAC(hmac_key, hashes.SHA256())
+        h.update(json.dumps(message, sort_keys=True).encode())
+        signature = h.finalize()
+
         return b64encode(signature).decode("utf-8")
 
-    def verify_signature(self, message, signature, sender_public_key):
+    def verify_signature(self, message, signature, sender_username):
+        """Verify a message signature using HMAC"""
         try:
-            sender_public_key.verify(
-                b64decode(signature),
-                json.dumps(message).encode(),
-                asymmetric_padding.PSS(
-                    mgf=asymmetric_padding.MGF1(hashes.SHA256()),
-                    salt_length=asymmetric_padding.PSS.MAX_LENGTH,
-                ),
-                hashes.SHA256(),
-            )
+            # Derive HMAC key
+            hmac_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b"location-hmac-key"
+            ).derive(self.session_key)
+
+            # Verify HMAC
+            h = hmac.HMAC(hmac_key, hashes.SHA256())
+            h.update(json.dumps(message, sort_keys=True).encode())
+            h.verify(b64decode(signature))
             return True
-        except Exception:
+        except Exception as e:
+            print(f"HMAC verification failed: {e}")
             return False
-
-    def get_public_key(self, username):
-        request = json.dumps({"type": "get_public_key", "target": username})
-        self.send_message(request)
-        response = json.loads(self.socket.recv(1024).decode("utf-8"))
-
-        if response["type"] != "public_key_response":
-            raise Exception("Failed to get public key")
-
-        # Verify key timestamp
-        key_created = response["key_created"]
-        if not isinstance(key_created, int):
-            raise Exception("Invalid key timestamp")
-
-        public_key_pem = b64decode(response["public_key"])
-        return serialization.load_pem_public_key(public_key_pem)
 
     def send_friend_request(self, friend_username):
         message = json.dumps(
@@ -823,16 +687,14 @@ if __name__ == "__main__":
                 print(f"Error: {e}")
         else:
             print("\n" + "=" * 50)  # Add separator line
-            print("Main Menu")
+            print("Main Menu, logged in as:", client.username)
             print("4. Update Location")
             print("5. Check Cell")
             print("6. Send Friend Request")
             print("7. View Friend Requests")
             print("8. Accept Friend Request")
             print("9. View Friends")
-            print("10. Send Message")
-            print("11. Check Messages")
-            print("12. Exit")
+            print("10. Exit")
             print("=" * 50 + "\n")  # Add separator line
             try:
                 choice = input("Choose an option: ")
@@ -852,12 +714,6 @@ if __name__ == "__main__":
                 elif choice == "9":
                     client.view_friend()
                 elif choice == "10":
-                    friend = input("Enter friend's username: ")
-                    msg = input("Enter message: ")
-                    client.msg_user(friend, msg)
-                elif choice == "11":
-                    client.check_messages()
-                elif choice == "12":
                     break
             except Exception as e:
                 print(f"Error: {e}")
