@@ -23,27 +23,6 @@ class NetworkError(Exception):
     pass
 
 
-# --- Updated MessageQueue with Locking ---
-class MessageQueue:
-    def __init__(self):
-        self.messages = {}
-        self.lock = threading.RLock()
-
-    def add_message(self, to_user, message):
-        with self.lock:
-            if to_user not in self.messages:
-                self.messages[to_user] = []
-            self.messages[to_user].append(
-                {"content": message, "timestamp": time.time()}
-            )
-
-    def get_messages(self, user):
-        with self.lock:
-            messages = self.messages.get(user, [])
-            self.messages[user] = []  # Clear after reading
-            return messages
-
-
 # --- Updated Config with Atomic File Operations ---
 class Config:
     def __init__(self):
@@ -115,11 +94,9 @@ class Client:
         self.grid_location = None
         # Thread safety locks
         self.friends_lock = threading.RLock()
-        self.message_queue_lock = threading.RLock()
         self.connection_lock = threading.RLock()
         self.stop_flag = threading.Event()  # Flag to signal the thread to stop
         # Use an instance of MessageQueue for queued messages
-        self.message_queue = MessageQueue()
 
     # --- Connection Management Methods ---
     def send_message(self, message):
@@ -324,10 +301,6 @@ class Client:
                 elif message_type == "friend_request_accepted":
                     self.friends = message.get("friends", [])
                     print("\nFriend list updated:", ", ".join(self.friends))
-                elif message_type == "received_message":
-                    print(
-                        f"\nMessage from {message['from_client_id']}: {message['content']}"
-                    )
                 elif message_type == "location_request":
                     from_client_id = message["from_client_id"]
                     # Store the last request for use in send_location
@@ -348,32 +321,10 @@ class Client:
                         print("Friend is nearby!")
                     else:
                         print("Friend is not nearby!")
-                elif message_type == "public_key_response":
-                    # Store the received public key for later use
-                    public_key_data = message.get("public_key", "")
-                    target_username = message.get("target", "")
 
-                    # Cache the public key
-                    print(f"DEBUG: Received public key for {target_username}")
-                    self.public_key_cache[target_username] = deserialize_public_key(public_key_data)
-
-                    if hasattr(self,
-                               "pending_public_key_requests") and target_username in self.pending_public_key_requests:
-                        print(f"DEBUG: Calling callback for {target_username}")
-                        callback = self.pending_public_key_requests.pop(target_username)
-                        callback(self.public_key_cache[target_username])
-                    else:
-                        print(f"DEBUG: No pending request for {target_username}, just caching")
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
-                elif message_type == "queued_messages":
-                    messages = message.get("messages", [])
-                    if messages:
-                        print("\nQueued messages:")
-                        for msg in messages:
-                            print(f"From {msg['from']}: {msg['content']}")
-                    else:
-                        print("No queued messages")
+
                 elif message_type == "location_update_success":
                     print("Location updated successfully")
                 elif message_type == "success":
@@ -653,93 +604,20 @@ class Client:
         if not self.private_key:
             raise ValueError("No private key available - not logged in?")
 
-        # Check if it's an EC key
-        if isinstance(self.private_key, ec.EllipticCurvePrivateKey):
-            # EC keys use a different signing mechanism
-            signature = self.private_key.sign(
-                json.dumps(message).encode(),
-                ec.ECDSA(hashes.SHA256())
-            )
-        else:
-            # RSA keys use PSS padding
-            signature = self.private_key.sign(
-                json.dumps(message).encode(),
-                asymmetric_padding.PSS(
-                    mgf=asymmetric_padding.MGF1(hashes.SHA256()),
-                    salt_length=asymmetric_padding.PSS.MAX_LENGTH,
-                ),
-                hashes.SHA256(),
-            )
+        signature = self.private_key.sign(
+            json.dumps(message).encode(),
+            ec.ECDSA(hashes.SHA256())
+        )
 
         return b64encode(signature).decode("utf-8")
 
     def verify_signature(self, message, signature, sender_public_key):
-        try:
-            # Check if it's an EC key
-            if isinstance(sender_public_key, ec.EllipticCurvePublicKey):
-                sender_public_key.verify(
-                    b64decode(signature),
-                    json.dumps(message).encode(),
-                    ec.ECDSA(hashes.SHA256())
-                )
-            else:
-                sender_public_key.verify(
-                    b64decode(signature),
-                    json.dumps(message).encode(),
-                    asymmetric_padding.PSS(
-                        mgf=asymmetric_padding.MGF1(hashes.SHA256()),
-                        salt_length=asymmetric_padding.PSS.MAX_LENGTH,
-                    ),
-                    hashes.SHA256(),
-                )
-            return True
-        except Exception:
-            return False
-
-    def get_public_key(self, username, callback=None):
-        """
-        Get the public key of another user
-
-        Args:
-            username: The username to get the public key for
-            callback: Optional callback function to call with the public key when received
-        """
-        print(f"DEBUG: Public key requested for {username}")
-
-        # Check if we already have the public key cached
-        if hasattr(self, "public_key_cache") and username in self.public_key_cache:
-            if callback:
-                print(f"DEBUG: Using cached key for {username}")
-                callback(self.public_key_cache[username])
-            return self.public_key_cache[username]
-
-        # Check if we're already waiting for this key
-        if hasattr(self, "pending_public_key_requests") and username in self.pending_public_key_requests:
-            if callback:
-                # Store multiple callbacks for the same username
-                print(f"DEBUG: Already waiting for key for {username}, adding callback")
-                old_callback = self.pending_public_key_requests[username]
-
-                # Create a combined callback that calls both the old and new callbacks
-                def combined_callback(key):
-                    old_callback(key)
-                    callback(key)
-
-                self.pending_public_key_requests[username] = combined_callback
-            return None
-
-        # Set up the callback BEFORE sending the request
-        if callback:
-            if not hasattr(self, "pending_public_key_requests"):
-                self.pending_public_key_requests = {}
-            print(f"DEBUG: Requesting key for {username} with callback")
-            self.pending_public_key_requests[username] = callback
-        else:
-            print(f"DEBUG: Requesting key for {username} without callback")
-
-        # Now send the request
-        request = json.dumps({"type": "get_public_key", "target": username})
-        self.send_message(request)
+        if isinstance(sender_public_key, ec.EllipticCurvePublicKey):
+            sender_public_key.verify(
+                b64decode(signature),
+                json.dumps(message).encode(),
+                ec.ECDSA(hashes.SHA256())
+            )
 
         return None  # Will be available through callback
     def send_friend_request(self, friend_username):
@@ -824,9 +702,7 @@ if __name__ == "__main__":
             print("7. View Friend Requests")
             print("8. Accept Friend Request")
             print("9. View Friends")
-            print("10. Send Message")
-            print("11. Check Messages")
-            print("12. Exit")
+            print("10. Exit")
             print("=" * 50 + "\n")  # Add separator line
             try:
                 choice = input("Choose an option: ")
@@ -846,12 +722,6 @@ if __name__ == "__main__":
                 elif choice == "9":
                     client.view_friend()
                 elif choice == "10":
-                    friend = input("Enter friend's username: ")
-                    msg = input("Enter message: ")
-                    client.msg_user(friend, msg)
-                elif choice == "11":
-                    client.check_messages()
-                elif choice == "12":
                     break
             except Exception as e:
                 print(f"Error: {e}")
