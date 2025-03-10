@@ -210,7 +210,7 @@ class Client:
     def receive_messages(self):
         while self.is_running:
             try:
-                data = self.socket.recv(4096).decode("utf-8")
+                data = self.socket.recv(16384).decode("utf-8")
                 if not data:
                     self.stop_flag.set()
                     print("Server connection closed")
@@ -455,7 +455,7 @@ class Client:
                 return False
 
             # Initialize a PierreProtocol instance with the same resolution used earlier.
-            pierre = PierreProtocol(resolution=1000, distance_threshold=response_data.get("threshold", 2500))
+            pierre = PierreProtocol(resolution=1000, distance_threshold=response_data.get("threshold", 4000))
 
             start_time = time.time()  # Start timer
 

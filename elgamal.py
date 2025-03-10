@@ -11,7 +11,8 @@ class PierreProtocol:
     Implementation of Pierre Protocol using EC ElGamal for secure proximity testing.
     """
 
-    def __init__(self, resolution=1000, distance_threshold=2500):
+    def __init__(self, resolution=1000, distance_threshold=4000):
+        ""
         self.resolution = resolution
         self.distance_threshold = distance_threshold
         self.curve = SECP256k1

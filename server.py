@@ -141,7 +141,7 @@ def handle_client(conn, addr, server_state: ServerState):
     username = None
     try:
         while True:
-            data = conn.recv(8192).decode("utf-8")
+            data = conn.recv(16384).decode("utf-8")
             if not data:
                 break  # Connection closed by client
 
