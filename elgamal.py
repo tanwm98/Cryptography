@@ -178,75 +178,52 @@ class PierreProtocol:
         Process a proximity request
 
         Args:
-            u, v: Responder's coordinates
+            u, v: Friend's coordinates
             request_data: Dictionary with encrypted values
             requester_public_key: Requester's public key
 
         Returns:
-            response_data: Dictionary with proximity test results
+            response_data: Dictionary with test results
         """
-        # Extract request parameters
-        encrypted_values = request_data.get("encrypted_values", {})
-
-        # Deserialize encrypted values
+        # Deserialize encrypted values from request_data
         encrypted_xr_squared_plus_yr_squared = self.deserialize_ciphertext(
-            encrypted_values.get("xr_squared_plus_yr_squared", {}))
+            request_data["encrypted_values"]["xr_squared_plus_yr_squared"])
         encrypted_2xr = self.deserialize_ciphertext(
-            encrypted_values.get("two_xr", {}))
+            request_data["encrypted_values"]["two_xr"])
         encrypted_2yr = self.deserialize_ciphertext(
-            encrypted_values.get("two_yr", {}))
+            request_data["encrypted_values"]["two_yr"])
 
-        # Convert responder's coordinates to grid coordinates
+        # Compute grid coordinates for the friend
         u_r, v_r = self.coordinates_to_cell(u, v)
 
-        # Calculate terms for distance calculation
-        term1 = self.scalar_multiply(encrypted_2xr, -u_r)  # -2*x_r*u_r
-        term2 = self.scalar_multiply(encrypted_2yr, -v_r)  # -2*y_r*v_r
-
-        # Add first three terms
+        # Compute the encrypted squared distance D_r:
+        # D_r = (x_r - u_r)^2 + (y_r - v_r)^2 = x_r^2 + y_r^2 - 2x_r*u_r - 2y_r*v_r + u_r^2 + v_r^2
+        term1 = self.scalar_multiply(encrypted_2xr, -u_r)
+        term2 = self.scalar_multiply(encrypted_2yr, -v_r)
         partial_sum = self.homomorphic_add(encrypted_xr_squared_plus_yr_squared, term1)
         partial_sum = self.homomorphic_add(partial_sum, term2)
-
-        # Encrypt Bob's squared sum and add it
         bob_term = self.encrypt(requester_public_key, u_r ** 2 + v_r ** 2)
         dr_ciphertext = self.homomorphic_add(partial_sum, bob_term)
 
-        # At this point, dr_ciphertext encrypts (x_r - u_r)² + (y_r - v_r)² = D_r
-
-        # Generate random non-zero values as specified in the Pierre protocol
-        rho0 = secrets.randbelow(self.n - 2) + 1  # range [1, n-1]
-        rho1 = secrets.randbelow(self.n - 2) + 1
-        rho2 = secrets.randbelow(self.n - 2) + 1
-        rho_threshold = secrets.randbelow(self.n - 2) + 1
-        # Prepare the three tests:
-        # 1. Same cell: D_r = 0
-        same_cell = self.scalar_multiply(dr_ciphertext, rho0)
-
-        # 2. Adjacent cell: D_r = 1
-        # We need to create E(D_r - 1) = E(D_r) + E(-1)
-        minus_one = self.encrypt(requester_public_key, -1)
-        dr_minus_one = self.homomorphic_add(dr_ciphertext, minus_one)
-        adjacent_cell = self.scalar_multiply(dr_minus_one, rho1)
+        # Determine candidate range based on distance threshold
         threshold_squared = (self.distance_threshold / self.resolution) ** 2
-        # Create E(D_r - threshold_squared)
-        minus_threshold = self.encrypt(requester_public_key, -threshold_squared)
-        dr_minus_threshold = self.homomorphic_add(dr_ciphertext, minus_threshold)
-        euclidean_test = self.scalar_multiply(dr_minus_threshold, rho_threshold)
-        # 3. Diagonally adjacent: D_r = 2
-        # We need to create E(D_r - 2) = E(D_r) + E(-2)
-        minus_two = self.encrypt(requester_public_key, -2)
-        dr_minus_two = self.homomorphic_add(dr_ciphertext, minus_two)
-        diagonal_cell = self.scalar_multiply(dr_minus_two, rho2)
+        threshold_int = int(threshold_squared)
 
-        # Create response with all three tests
+        # For each candidate i in [0, threshold_int]:
+        euclidean_tests = {}
+        for i in range(threshold_int + 1):
+            minus_i = self.encrypt(requester_public_key, -i)
+            test_ciphertext = self.homomorphic_add(dr_ciphertext, minus_i)
+            # Apply random scalar to prevent information leakage
+            random_scalar = secrets.randbelow(self.n - 1) + 1
+            test_ciphertext = self.scalar_multiply(test_ciphertext, random_scalar)
+            euclidean_tests[str(i)] = self.serialize_ciphertext(test_ciphertext)
+
+        # Return response_data
         response_data = {
-            "same_cell": self.serialize_ciphertext(same_cell),
-            "adjacent_cell": self.serialize_ciphertext(adjacent_cell),
-            "diagonal_cell": self.serialize_ciphertext(diagonal_cell),
-            "euclidean_test": self.serialize_ciphertext(euclidean_test),
-            "threshold": self.distance_threshold  # Include the threshold for reference
+            "euclidean_tests": euclidean_tests,
+            "threshold": self.distance_threshold
         }
-
         return response_data
 
     # Serialization methods

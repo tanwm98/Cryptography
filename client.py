@@ -434,104 +434,53 @@ class Client:
             return False
 
     def proximity_check_cell(self, location_data):
-        nearby_type = "unknown"  # Initialize this variable
         """
-        Checks if a friend is nearby by examining the encrypted response data.
-        Uses the Pierre protocol to determine if users are in the same, adjacent,
-        or diagonally adjacent cells.
-        """
-        # Verify the signature using the ephemeral public key from the response
-        if "signature" in location_data:
-            peer_public_key_serialized = location_data.get("ephemeral_public_key")
-            if not peer_public_key_serialized:
-                print("Missing ephemeral public key in response for signature verification")
-                return False
-            signature = location_data["signature"]
-            # Create a copy of the message without the signature field
-            data_to_verify = location_data.copy()
-            del data_to_verify["signature"]
-            if not self.verify_signature_with_shared_key(data_to_verify, signature, peer_public_key_serialized):
-                print("Warning: Location data signature verification failed!")
-                return False
+            Check if the friend is within the threshold distance using multiple discrete tests.
 
+            Args:
+                location_data: Dictionary containing response data from the friend.
+
+            Returns:
+                Boolean indicating if friend is nearby (within threshold).
+            """
         try:
+            # Extract the response payload and its data
             response_payload = location_data.get("response_payload", {})
             response_data = response_payload.get("response_data", {})
 
-            # Initialize Pierre protocol
-            pierre = PierreProtocol(resolution=1000)
+            # Get the dictionary of euclidean tests from the response data
+            euclidean_tests = response_data.get("euclidean_tests", {})
+            if not euclidean_tests:
+                print("No Euclidean tests received in response")
+                return False
 
-            # Extract all three ciphertexts
-            same_cell_data = response_data.get("same_cell", {})
-            adjacent_cell_data = response_data.get("adjacent_cell", {})
-            diagonal_cell_data = response_data.get("diagonal_cell", {})
-
-            # Deserialize the ciphertexts
-            is_nearby = False
+            # Initialize a PierreProtocol instance with the same resolution used earlier.
+            pierre = PierreProtocol(resolution=1000, distance_threshold=response_data.get("threshold", 2500))
 
             start_time = time.time()  # Start timer
 
-            print("\n--- Debug Information ---")
-            print(f"Client coordinates: ({self.x}, {self.y}) -> cell: {self.x // 1000}, {self.y // 1000}")
-            print(f"Testing proximity with friend...")
-
-            if same_cell_data:
-                same_cell = pierre.deserialize_ciphertext(same_cell_data)
-                # Debug decrypt vs is_zero
-                dec_result = pierre.decrypt(self.temp_private_key, same_cell)
-                is_zero_result = pierre.is_zero(self.temp_private_key, same_cell)
-                print(f"Same cell test: decrypt={dec_result}, is_zero={is_zero_result}")
-                if pierre.is_zero(self.temp_private_key, same_cell):
+            is_nearby = False
+            # Iterate over all candidate test values
+            for test_value, test_data in euclidean_tests.items():
+                # Deserialize the ciphertext for the candidate test
+                test_ciphertext = pierre.deserialize_ciphertext(test_data)
+                # Decrypt the test ciphertext using the ephemeral private key stored from the request
+                result = pierre.decrypt(self.temp_private_key, test_ciphertext)
+                # If the decryption returns 0, that candidate test indicates D_r equals that candidate value
+                # (and hence D_r is within the threshold).
+                if result == 0:
                     is_nearby = True
-                    nearby_type = "same cell"
-
-            if not is_nearby and adjacent_cell_data:
-                adjacent_cell = pierre.deserialize_ciphertext(adjacent_cell_data)
-                # Debug
-                dec_result = pierre.decrypt(self.temp_private_key, adjacent_cell)
-                is_zero_result = pierre.is_zero(self.temp_private_key, adjacent_cell)
-                print(f"Adjacent cell test: decrypt={dec_result}, is_zero={is_zero_result}")
-                if pierre.is_zero(self.temp_private_key, adjacent_cell):
-                    is_nearby = True
-                    nearby_type = "adjacent cell"
-
-            if not is_nearby and diagonal_cell_data:
-                diagonal_cell = pierre.deserialize_ciphertext(diagonal_cell_data)
-                # Debug
-                dec_result = pierre.decrypt(self.temp_private_key, diagonal_cell)
-                is_zero_result = pierre.is_zero(self.temp_private_key, diagonal_cell)
-                print(f"Diagonal cell test: decrypt={dec_result}, is_zero={is_zero_result}")
-                if pierre.is_zero(self.temp_private_key, diagonal_cell):
-                    is_nearby = True
-                    nearby_type = "diagonally adjacent cell"
-
-            if not is_nearby and "euclidean_test" in response_data:
-                euclidean_test_data = response_data.get("euclidean_test", {})
-                threshold_value = response_data.get("threshold", 2500)  # Default if not provided
-
-                if euclidean_test_data:
-                    euclidean_test = pierre.deserialize_ciphertext(euclidean_test_data)
-                    # Debug
-                    dec_result = pierre.decrypt(self.temp_private_key, euclidean_test)
-                    is_zero_result = pierre.is_zero(self.temp_private_key, euclidean_test)
-                    print(
-                        f"Euclidean distance test (threshold {threshold_value}): decrypt={dec_result}, is_zero={is_zero_result}")
-
-                    if pierre.is_zero(self.temp_private_key, euclidean_test):
-                        is_nearby = True
-                        nearby_type = f"within {threshold_value} distance units"
-            print("--- End Debug ---\n")
+                    break
 
             end_time = time.time()  # End timer
 
-            # Report results
             print(f"\nProximity check took {end_time - start_time:.6f} seconds")
             if is_nearby:
-                print(f"\nFriend is nearby! (in {nearby_type})")
-                return True
+                print("\nFriend is nearby (within threshold distance)!")
             else:
                 print("\nFriend is not nearby!")
-                return False
+
+            return is_nearby
 
         except Exception as e:
             print(f"\nError in proximity check: {e}")
