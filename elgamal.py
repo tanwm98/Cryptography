@@ -1,27 +1,22 @@
-from base64 import b64encode, b64decode
 from ecdsa import SECP256k1
 from ecdsa.ellipticcurve import Point, INFINITY
 import secrets
 import json
+import time
+import struct
 
 
 class PierreProtocol:
     """
-    Implementation of the Pierre Protocol for private proximity detection
-    using EC ElGamal homomorphic encryption.
+    Implementation of Pierre Protocol using EC ElGamal for secure proximity testing.
     """
 
-    def __init__(self, resolution=1000):
-        """
-        Initialize the Pierre Protocol
-
-        Args:
-            resolution: The size of each grid cell (default 1000)
-        """
+    def __init__(self, resolution=1000, distance_threshold=2500):
         self.resolution = resolution
+        self.distance_threshold = distance_threshold
         self.curve = SECP256k1
-        self.G = self.curve.generator  # Generator point
-        self.n = self.curve.order  # Order of the group
+        self.G = self.curve.generator
+        self.n = self.curve.order
 
     def coordinates_to_cell(self, x, y):
         """Convert coordinates to grid cell coordinates."""
@@ -35,15 +30,15 @@ class PierreProtocol:
 
     def encrypt(self, public_key, message, ephemeral_r=None):
         """
-        Encrypt a message using exponential EC ElGamal.
+        Encrypt a message using EC ElGamal.
 
         Args:
             public_key: Recipient's public key (Point)
-            message: Integer message to encrypt. (0 is encoded as the identity)
-            ephemeral_r: Optional random scalar.
+            message: Integer message to encrypt
+            ephemeral_r: Optional random scalar
 
         Returns:
-            (c1, c2): Tuple of Points representing the ciphertext.
+            Tuple of Points representing the ciphertext
         """
         if ephemeral_r is None:
             ephemeral_r = secrets.randbelow(self.n - 1) + 1
@@ -51,37 +46,75 @@ class PierreProtocol:
         # Compute c1 = r * G
         c1 = ephemeral_r * self.G
 
-        # Encode message as m * G; for m == 0, we use the identity point
-        message_point = INFINITY if message == 0 else message * self.G
+        # Encode message as m * G
+        message_point = message * self.G
 
         # Compute c2 = r * public_key + message_point
         c2 = ephemeral_r * public_key + message_point
 
         return c1, c2
 
-    def decrypt(self, private_key, ciphertext):
+    def decrypt(self, private_key, ciphertext, max_value=5):
         """
-        Decrypt a ciphertext using exponential EC ElGamal.
+        Decrypt a ciphertext for small values using brute force.
 
         Args:
             private_key: Recipient's private key (scalar)
             ciphertext: Tuple of Points (c1, c2)
+            max_value: Maximum expected value to check
 
         Returns:
-            0 if decryption yields the identity (i.e. m == 0),
-            or a nonzero value indicator (1) if m ≠ 0.
+            The decrypted message, or None if not found
         """
         c1, c2 = ciphertext
-        # Compute m * G = c2 - a * c1
-        m_point = c2 + (-(private_key * c1))
+        # Compute shared secret s = private_key * c1
+        shared_secret = private_key * c1
+        # Compute m * G = c2 - shared_secret
+        m_point = c2 + (-shared_secret)
+
+        # For small values like 0, 1, 2 (needed for the Pierre protocol)
+        # we can efficiently check if it's 0
         if m_point == INFINITY:
             return 0
-        else:
-            return 1
+
+        # For the Pierre protocol, we're primarily interested in whether the result is zero
+        # For more robust implementation, we can also check small values directly
+        # Compare m_point with i*G for i in range(max_value)
+        for i in range(1, max_value + 1):
+            if i * self.G == m_point:
+                return i
+
+        # If the point doesn't match any of our expected small values,
+        # return a non-zero value to indicate "not in same cell"
+        return 999  # Large value to indicate not the same cell
+
+    def is_zero(self, private_key, ciphertext):
+        """Debug version of is_zero with more information"""
+        c1, c2 = ciphertext
+        # Compute shared secret s = private_key * c1
+        shared_secret = private_key * c1
+        # Calculate m_point = c2 - shared_secret
+        m_point = c2 + (-shared_secret)
+
+        print(f"Debug is_zero:")
+        print(f"  c1: {c1}")
+        print(f"  c2: {c2}")
+        print(f"  shared_secret: {shared_secret}")
+        print(f"  m_point: {m_point}")
+        print(f"  infinity check: {m_point == INFINITY}")
+        print(f"  c2 == shared_secret: {c2 == shared_secret}")
+
+        return c2 == shared_secret
 
     def homomorphic_add(self, ciphertext1, ciphertext2):
         """
         Add two ciphertexts homomorphically.
+
+        Args:
+            ciphertext1, ciphertext2: Encrypted values
+
+        Returns:
+            Encryption of the sum
         """
         c1_1, c2_1 = ciphertext1
         c1_2, c2_2 = ciphertext2
@@ -92,13 +125,28 @@ class PierreProtocol:
     def scalar_multiply(self, ciphertext, scalar):
         """
         Multiply a ciphertext by a scalar.
+
+        Args:
+            ciphertext: Encrypted value
+            scalar: Integer to multiply by
+
+        Returns:
+            Encryption of the product
         """
         c1, c2 = ciphertext
         return scalar * c1, scalar * c2
 
     def prepare_request(self, x, y, public_key, private_key):
         """
-        Prepare a proximity request as Alice (the requester)
+        Prepare a proximity request
+
+        Args:
+            x, y: Requester's coordinates
+            public_key: Requester's public key
+            private_key: Requester's private key (stored for later use)
+
+        Returns:
+            request_data: Dictionary with encrypted values
         """
         # Convert to grid coordinates
         x_r, y_r = self.coordinates_to_cell(x, y)
@@ -127,85 +175,99 @@ class PierreProtocol:
 
     def process_request(self, u, v, request_data, requester_public_key):
         """
-        Process a proximity request as Bob (the responder)
+        Process a proximity request
+
+        Args:
+            u, v: Friend's coordinates
+            request_data: Dictionary with encrypted values
+            requester_public_key: Requester's public key
+
+        Returns:
+            response_data: Dictionary with test results
         """
-        # Extract request parameters
-        encrypted_values = request_data.get("encrypted_values", {})
-
-        # Deserialize encrypted values
+        # Deserialize encrypted values from request_data
         encrypted_xr_squared_plus_yr_squared = self.deserialize_ciphertext(
-            encrypted_values.get("xr_squared_plus_yr_squared", {}))
+            request_data["encrypted_values"]["xr_squared_plus_yr_squared"])
         encrypted_2xr = self.deserialize_ciphertext(
-            encrypted_values.get("two_xr", {}))
+            request_data["encrypted_values"]["two_xr"])
         encrypted_2yr = self.deserialize_ciphertext(
-            encrypted_values.get("two_yr", {}))
+            request_data["encrypted_values"]["two_yr"])
 
-        # Convert Bob's coordinates to grid coordinates
+        # Compute grid coordinates for the friend
         u_r, v_r = self.coordinates_to_cell(u, v)
 
-        # Calculate terms for distance calculation
-        term1 = self.scalar_multiply(encrypted_2xr, -u_r)  # -2*x_r*u_r
-        term2 = self.scalar_multiply(encrypted_2yr, -v_r)  # -2*y_r*v_r
-
-        # Add first three terms
+        # Compute the encrypted squared distance D_r:
+        # D_r = (x_r - u_r)^2 + (y_r - v_r)^2 = x_r^2 + y_r^2 - 2x_r*u_r - 2y_r*v_r + u_r^2 + v_r^2
+        term1 = self.scalar_multiply(encrypted_2xr, -u_r)
+        term2 = self.scalar_multiply(encrypted_2yr, -v_r)
         partial_sum = self.homomorphic_add(encrypted_xr_squared_plus_yr_squared, term1)
         partial_sum = self.homomorphic_add(partial_sum, term2)
-
-        # Encrypt Bob's squared sum and add it
         bob_term = self.encrypt(requester_public_key, u_r ** 2 + v_r ** 2)
         dr_ciphertext = self.homomorphic_add(partial_sum, bob_term)
 
-        # Generate random values for the protocol
-        rho0 = secrets.randbelow(self.n - 1) + 1
+        # Determine candidate range based on distance threshold
+        threshold_squared = (self.distance_threshold / self.resolution) ** 2
+        threshold_int = int(threshold_squared)
 
-        # Compute the three responses
-        same_cell = self.scalar_multiply(dr_ciphertext, rho0)
+        # For each candidate i in [0, threshold_int]:
+        euclidean_tests = {}
+        for i in range(threshold_int + 1):
+            minus_i = self.encrypt(requester_public_key, -i)
+            test_ciphertext = self.homomorphic_add(dr_ciphertext, minus_i)
+            # Apply random scalar to prevent information leakage
+            random_scalar = secrets.randbelow(self.n - 1) + 1
+            test_ciphertext = self.scalar_multiply(test_ciphertext, random_scalar)
+            euclidean_tests[str(i)] = self.serialize_ciphertext(test_ciphertext)
 
-        # Create response
+        # Return response_data
         response_data = {
-            "same_cell": self.serialize_ciphertext(same_cell)
+            "euclidean_tests": euclidean_tests,
+            "threshold": self.distance_threshold
         }
-
         return response_data
 
-    # Serialization methods from the code snippet
+    # Serialization methods
     def serialize_point(self, point):
+        """Convert EC point to serializable format"""
         if point == INFINITY:
             return {"x": "INFINITY", "y": "INFINITY"}
         return {"x": str(point.x()), "y": str(point.y())}
 
     def deserialize_point(self, data):
-        if data["x"] == "INFINITY":
+        """Convert serialized format back to EC point"""
+        if data.get("x") == "INFINITY":
             return INFINITY
         return Point(self.curve.curve, int(data["x"]), int(data["y"]))
 
     def serialize_ciphertext(self, ciphertext):
+        """Convert ciphertext to serializable format"""
         c1, c2 = ciphertext
         return {"c1": self.serialize_point(c1), "c2": self.serialize_point(c2)}
 
     def deserialize_ciphertext(self, data):
+        """Convert serialized format back to ciphertext"""
         c1 = self.deserialize_point(data["c1"])
         c2 = self.deserialize_point(data["c2"])
         return c1, c2
 
 
-# Helper functions for integration with client/server code
+# Helper functions for integration with client.py
+
 def serialize_public_key(public_key):
     """Convert EC public key to JSON-serializable format"""
+    if public_key is None:
+        return None
     return {"x": str(public_key.x()), "y": str(public_key.y())}
 
 
 def deserialize_public_key(serialized_key):
     """Restore public key from serialized format"""
     try:
-        if not serialized_key:
-            print("Empty serialized key received")
+        if not serialized_key or "x" not in serialized_key:
             return None
-
         x = int(serialized_key["x"])
         y = int(serialized_key["y"])
         return Point(SECP256k1.curve, x, y)
-
     except Exception as e:
         print(f"Error deserializing public key: {e}")
         return None
