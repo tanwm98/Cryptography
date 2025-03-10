@@ -476,7 +476,7 @@ class Client:
 
             print(f"\nProximity check took {end_time - start_time:.6f} seconds")
             if is_nearby:
-                print("\nFriend is nearby (within threshold distance)!")
+                print("\nFriend is nearby!")
             else:
                 print("\nFriend is not nearby!")
 
