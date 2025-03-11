@@ -11,7 +11,7 @@ class PierreProtocol:
     Implementation of Pierre Protocol using EC ElGamal for secure proximity testing.
     """
 
-    def __init__(self, resolution=1000, distance_threshold=4000):
+    def __init__(self, resolution=1000, distance_threshold=3000):
         ""
         self.resolution = resolution
         self.distance_threshold = distance_threshold
@@ -88,24 +88,6 @@ class PierreProtocol:
         # If the point doesn't match any of our expected small values,
         # return a non-zero value to indicate "not in same cell"
         return 999  # Large value to indicate not the same cell
-
-    def is_zero(self, private_key, ciphertext):
-        """Debug version of is_zero with more information"""
-        c1, c2 = ciphertext
-        # Compute shared secret s = private_key * c1
-        shared_secret = private_key * c1
-        # Calculate m_point = c2 - shared_secret
-        m_point = c2 + (-shared_secret)
-
-        print(f"Debug is_zero:")
-        print(f"  c1: {c1}")
-        print(f"  c2: {c2}")
-        print(f"  shared_secret: {shared_secret}")
-        print(f"  m_point: {m_point}")
-        print(f"  infinity check: {m_point == INFINITY}")
-        print(f"  c2 == shared_secret: {c2 == shared_secret}")
-
-        return c2 == shared_secret
 
     def homomorphic_add(self, ciphertext1, ciphertext2):
         """

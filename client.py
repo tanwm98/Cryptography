@@ -455,7 +455,7 @@ class Client:
                 return False
 
             # Initialize a PierreProtocol instance with the same resolution used earlier.
-            pierre = PierreProtocol(resolution=1000, distance_threshold=response_data.get("threshold", 4000))
+            pierre = PierreProtocol(resolution=1000, distance_threshold=response_data.get("threshold", 3000))
 
             start_time = time.perf_counter()  # Start timer
 
