@@ -457,7 +457,7 @@ class Client:
             # Initialize a PierreProtocol instance with the same resolution used earlier.
             pierre = PierreProtocol(resolution=1000, distance_threshold=response_data.get("threshold", 4000))
 
-            start_time = time.time()  # Start timer
+            start_time = time.perf_counter()  # Start timer
 
             is_nearby = False
             # Iterate over all candidate test values
@@ -472,7 +472,7 @@ class Client:
                     is_nearby = True
                     break
 
-            end_time = time.time()  # End timer
+            end_time = time.perf_counter()  # End timer
 
             print(f"\nProximity check took {end_time - start_time:.6f} seconds")
             if is_nearby:
