@@ -264,9 +264,24 @@ class Client:
                         self.send_location(from_client_id)
                     else:
                         print(f"Received location request without data from {from_client_id}")
-                elif message_type == "location_data":
-                    location = message["location"]
-                    self.proximity_check_cell(location)
+                elif message_type == "location_response":
+                    to_client_id = message.get("to_client_id")
+                    ephemeral_public_key = message.get("ephemeral_public_key")
+                    signature = message.get("signature")
+                    location = message.get("location", {})
+
+                    # Only process if we're the intended recipient
+                    if to_client_id == self.username:
+                        # Create a copy of the message without the signature for verification
+                        message_to_verify = message.copy()
+                        message_to_verify.pop("signature", None)
+
+                        # Verify the signature before processing
+                        if self.verify_signature_with_shared_key(message_to_verify, signature,
+                                                                 ephemeral_public_key):
+                            self.proximity_check_cell(location)
+                        else:
+                            print("Warning: Received location response with invalid signature!")
 
                 elif message_type == "error":
                     print(f"Error: {message['message']}")
@@ -383,11 +398,11 @@ class Client:
                     }
                 }
             }
-
             # Sign the response using the shared HMAC key
             h = hmac.HMAC(shared_hmac_key, hashes.SHA256())
             h.update(json.dumps(response_message_dict, sort_keys=True).encode())
             signature = b64encode(h.finalize()).decode("utf-8")
+            response_message_dict = response_message_dict.copy()
             response_message_dict["signature"] = signature
 
             # Send the signed response as JSON
@@ -421,28 +436,56 @@ class Client:
         """
         Verifies an HMAC signature using a shared key derived from the ephemeral key exchange.
         """
-        shared_hmac_key = self.derive_shared_hmac_key(peer_public_key_serialized)
-        if shared_hmac_key is None:
-            return False
-        h = hmac.HMAC(shared_hmac_key, hashes.SHA256())
-        h.update(json.dumps(message, sort_keys=True).encode())
         try:
-            h.verify(b64decode(signature))
-            return True
+            shared_hmac_key = self.derive_shared_hmac_key(peer_public_key_serialized)
+            if shared_hmac_key is None:
+                print("Could not derive shared HMAC key")
+                return False
+
+            # Create a signing version that matches exactly what was signed
+            # Focus only on the core parts of the message that would have been signed
+            message_to_verify = {
+                "type": message.get("type"),
+                "to_client_id": message.get("to_client_id"),
+                "ephemeral_public_key": message.get("ephemeral_public_key"),
+                "location": message.get("location")
+            }
+
+            # Convert any float timestamps to int to match what would have been signed
+            if "location" in message_to_verify and "response_payload" in message_to_verify["location"]:
+                payload = message_to_verify["location"]["response_payload"]
+                if "timestamp" in payload and isinstance(payload["timestamp"], float):
+                    payload["timestamp"] = int(payload["timestamp"])
+
+            h = hmac.HMAC(shared_hmac_key, hashes.SHA256())
+            h.update(json.dumps(message_to_verify, sort_keys=True).encode())
+
+            try:
+                h.verify(b64decode(signature))
+                return True
+            except Exception as e:
+                print(f"HMAC verification failed: {e}")
+                # Print the actual digest for comparison
+                h2 = hmac.HMAC(shared_hmac_key, hashes.SHA256())
+                h2.update(json.dumps(message_to_verify, sort_keys=True).encode())
+                expected_sig = b64encode(h2.finalize()).decode("utf-8")
+                print(f"Expected signature: {expected_sig}")
+                return False
         except Exception as e:
-            print(f"HMAC verification failed: {e}")
+            print(f"Error verifying signature: {e}")
+            traceback.print_exc()
             return False
 
     def proximity_check_cell(self, location_data):
         """
-            Check if the friend is within the threshold distance using multiple discrete tests.
+        Check if the friend is within the threshold distance using multiple discrete tests.
 
-            Args:
-                location_data: Dictionary containing response data from the friend.
+        Args:
+            location_data: Dictionary containing response data from the friend.
 
-            Returns:
-                Boolean indicating if friend is nearby (within threshold).
-            """
+        Returns:
+            Boolean indicating if friend is nearby (within threshold).
+        """
         try:
             # Extract the response payload and its data
             response_payload = location_data.get("response_payload", {})

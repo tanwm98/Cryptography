@@ -235,7 +235,10 @@ def handle_client(conn, addr, server_state: ServerState):
                     target_session = server_state.get_client(requesting_client_id)
                     if target_session:
                         response_message = {
-                            "type": "location_data",
+                            "type": "location_response",
+                            "to_client_id": requesting_client_id,
+                            "ephemeral_public_key": message.get("ephemeral_public_key"),
+                            "signature": message.get("signature"),
                             "location": location_data,
                             "timestamp": time.time()
                         }
