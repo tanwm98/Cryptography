@@ -1,10 +1,6 @@
 from ecdsa import SECP256k1
 from ecdsa.ellipticcurve import Point, INFINITY
 import secrets
-import json
-import time
-import struct
-
 
 class PierreProtocol:
     """
